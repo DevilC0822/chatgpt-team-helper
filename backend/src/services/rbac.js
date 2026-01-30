@@ -165,7 +165,6 @@ export async function getAdminMenuTreeForAccessContext(accessContext, db) {
   const allowed = new Set((access.menus || []).map(String))
   if (!access.isSuperAdmin) {
     allowed.add('user_info')
-    allowed.add('my_orders')
     allowed.delete('stats')
   }
   return filterMenuTreeByAllowedKeys(tree, allowed)
