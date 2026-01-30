@@ -117,7 +117,6 @@ export const getFallbackAdminMenuTree = (menuKeys?: string[] | null, roleKeys?: 
   const allowed = new Set((menuKeys || []).map(String))
   if (!isSuperAdmin) {
     allowed.add('user_info')
-    allowed.add('my_orders')
     allowed.delete('stats')
   }
 

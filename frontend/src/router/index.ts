@@ -299,7 +299,7 @@ router.beforeEach(async (to, from, next) => {
 
   const requiredMenuKey = String((to.meta as any)?.requiredMenuKey || '').trim()
   if (to.meta.requiresAuth && requiredMenuKey) {
-    const alwaysAllowed = requiredMenuKey === 'user_info' || requiredMenuKey === 'my_orders'
+    const alwaysAllowed = requiredMenuKey === 'user_info'
     if (!isSuperAdmin && !alwaysAllowed && !menus.includes(requiredMenuKey)) {
       next(defaultAdminPath)
       return
