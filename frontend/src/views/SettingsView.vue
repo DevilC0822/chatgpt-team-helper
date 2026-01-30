@@ -87,7 +87,8 @@ const featureFlags = ref({
   xhs: true,
   xianyu: true,
   payment: true,
-  openAccounts: true
+  openAccounts: true,
+  registration: true
 })
 const featureFlagsError = ref('')
 const featureFlagsSuccess = ref('')
@@ -220,7 +221,8 @@ const loadFeatureFlags = async () => {
       xhs: next.xhs !== false,
       xianyu: next.xianyu !== false,
       payment: next.payment !== false,
-      openAccounts: next.openAccounts !== false
+      openAccounts: next.openAccounts !== false,
+      registration: next.registration !== false
     }
     appConfigStore.features = { ...featureFlags.value }
   } catch (err: any) {
@@ -241,7 +243,8 @@ const saveFeatureFlags = async () => {
       xhs: next.xhs !== false,
       xianyu: next.xianyu !== false,
       payment: next.payment !== false,
-      openAccounts: next.openAccounts !== false
+      openAccounts: next.openAccounts !== false,
+      registration: next.registration !== false
     }
     appConfigStore.features = { ...featureFlags.value }
     featureFlagsSuccess.value = '已保存'
@@ -1089,6 +1092,18 @@ const savePointsWithdrawSettings = async () => {
               <input
                 type="checkbox"
                 v-model="featureFlags.openAccounts"
+                class="w-6 h-6 rounded-md border-gray-300 text-blue-600 focus:ring-blue-500"
+              />
+            </div>
+
+            <div class="flex items-center justify-between p-4 bg-gray-50 rounded-2xl border border-gray-100">
+              <div class="space-y-1">
+                <p class="font-medium text-gray-900">允许用户注册</p>
+                <p class="text-xs text-gray-500">关闭后注册页面将不可用</p>
+              </div>
+              <input
+                type="checkbox"
+                v-model="featureFlags.registration"
                 class="w-6 h-6 rounded-md border-gray-300 text-blue-600 focus:ring-blue-500"
               />
             </div>

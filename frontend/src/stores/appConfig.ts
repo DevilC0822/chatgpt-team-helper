@@ -12,6 +12,7 @@ export type FeatureFlags = {
   xianyu: boolean
   payment: boolean
   openAccounts: boolean
+  registration: boolean
 }
 
 export const useAppConfigStore = defineStore('app-config', () => {
@@ -26,7 +27,8 @@ export const useAppConfigStore = defineStore('app-config', () => {
     xhs: true,
     xianyu: true,
     payment: true,
-    openAccounts: true
+    openAccounts: true,
+    registration: true
   })
 
   const resolvedTurnstileSiteKey = computed(() => (turnstileSiteKey.value || FALLBACK_TURNSTILE_SITE_KEY || '').trim())
@@ -69,6 +71,7 @@ export const useAppConfigStore = defineStore('app-config', () => {
       if ('xianyu' in config.features) next.xianyu = Boolean((config.features as any).xianyu)
       if ('payment' in config.features) next.payment = Boolean((config.features as any).payment)
       if ('openAccounts' in config.features) next.openAccounts = Boolean((config.features as any).openAccounts)
+      if ('registration' in config.features) next.registration = Boolean((config.features as any).registration)
       features.value = next
     }
   }

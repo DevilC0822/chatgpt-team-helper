@@ -1,4 +1,5 @@
 import express from 'express'
+import bcrypt from 'bcryptjs'
 import { getDatabase, saveDatabase } from '../database/init.js'
 import { authenticateToken } from '../middleware/auth.js'
 import { requireSuperAdmin } from '../middleware/rbac.js'
@@ -292,7 +293,7 @@ router.put('/feature-flags', async (req, res) => {
     }
 
     const nextFlags = {}
-    const keys = ['xhs', 'xianyu', 'payment', 'openAccounts']
+    const keys = ['xhs', 'xianyu', 'payment', 'openAccounts', 'registration']
     for (const key of keys) {
       if (!(key in payload)) continue
       const value = normalizeFlag(payload?.[key])
@@ -312,6 +313,7 @@ router.put('/feature-flags', async (req, res) => {
     if ('xianyu' in nextFlags) upsertSystemConfigValue(db, 'feature_xianyu_enabled', nextFlags.xianyu ? 'true' : 'false')
     if ('payment' in nextFlags) upsertSystemConfigValue(db, 'feature_payment_enabled', nextFlags.payment ? 'true' : 'false')
     if ('openAccounts' in nextFlags) upsertSystemConfigValue(db, 'feature_open_accounts_enabled', nextFlags.openAccounts ? 'true' : 'false')
+    if ('registration' in nextFlags) upsertSystemConfigValue(db, 'feature_registration_enabled', nextFlags.registration ? 'true' : 'false')
 
     saveDatabase()
     invalidateFeatureFlagsCache()
@@ -1737,6 +1739,84 @@ router.put('/rbac/users/:id', async (req, res) => {
     res.json({ user })
   } catch (error) {
     console.error('Update user error:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+// 创建用户（管理员直接创建）
+router.post('/rbac/users', async (req, res) => {
+  try {
+    const body = req.body || {}
+    const username = String(body.username ?? '').trim()
+    const email = normalizeEmail(body.email)
+    const password = String(body.password ?? '')
+    const roleKey = String(body.roleKey ?? '').trim() || 'user'
+    const inviteEnabled = body.inviteEnabled !== false
+
+    if (!username) {
+      return res.status(400).json({ error: '用户名不能为空' })
+    }
+    if (username.length < 2 || username.length > 50) {
+      return res.status(400).json({ error: '用户名长度需在 2-50 个字符之间' })
+    }
+    if (!EMAIL_REGEX.test(email)) {
+      return res.status(400).json({ error: '邮箱格式不正确' })
+    }
+    if (!password || password.length < 6) {
+      return res.status(400).json({ error: '密码至少需要 6 个字符' })
+    }
+
+    const db = await getDatabase()
+
+    // 检查用户名和邮箱是否已存在
+    const duplicateUsername = db.exec(
+      'SELECT id FROM users WHERE lower(username) = lower(?) LIMIT 1',
+      [username]
+    )
+    if (duplicateUsername[0]?.values?.length) {
+      return res.status(409).json({ error: '用户名已存在' })
+    }
+
+    const duplicateEmail = db.exec(
+      'SELECT id FROM users WHERE lower(email) = lower(?) LIMIT 1',
+      [email]
+    )
+    if (duplicateEmail[0]?.values?.length) {
+      return res.status(409).json({ error: '邮箱已注册' })
+    }
+
+    // 验证角色是否存在
+    const roleResult = db.exec('SELECT id FROM roles WHERE role_key = ? LIMIT 1', [roleKey])
+    const roleId = roleResult[0]?.values?.length ? roleResult[0].values[0][0] : null
+    if (!roleId) {
+      return res.status(400).json({ error: '指定的角色不存在' })
+    }
+
+    // 创建用户
+    const hashedPassword = bcrypt.hashSync(password, 10)
+    db.run(
+      `
+        INSERT INTO users (username, password, email, invite_enabled, points, created_at)
+        VALUES (?, ?, ?, ?, 0, DATETIME('now', 'localtime'))
+      `,
+      [username, hashedPassword, email, inviteEnabled ? 1 : 0]
+    )
+
+    const userIdResult = db.exec('SELECT id FROM users WHERE email = ? LIMIT 1', [email])
+    const userId = userIdResult[0]?.values?.length ? userIdResult[0].values[0][0] : null
+    if (!userId) {
+      return res.status(500).json({ error: '用户创建失败' })
+    }
+
+    // 分配角色
+    db.run('INSERT OR IGNORE INTO user_roles (user_id, role_id) VALUES (?, ?)', [userId, roleId])
+
+    saveDatabase()
+
+    const user = getUserWithRoles(db, userId)
+    res.status(201).json({ user })
+  } catch (error) {
+    console.error('Create user error:', error)
     res.status(500).json({ error: 'Internal server error' })
   }
 })

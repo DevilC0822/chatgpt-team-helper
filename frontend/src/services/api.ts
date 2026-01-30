@@ -1107,6 +1107,17 @@ export const adminService = {
     const response = await api.delete(`/admin/rbac/users/${userId}`)
     return response.data
   },
+
+  async createUser(payload: {
+    username: string
+    email: string
+    password: string
+    roleKey?: string
+    inviteEnabled?: boolean
+  }): Promise<{ user: RbacUser }> {
+    const response = await api.post('/admin/rbac/users', payload)
+    return response.data
+  },
 }
 
 export type AccountRecoveryRedeemState = 'pending' | 'failed' | 'done'

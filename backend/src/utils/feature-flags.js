@@ -4,14 +4,16 @@ const FEATURE_FLAG_KEYS = [
   'feature_xhs_enabled',
   'feature_xianyu_enabled',
   'feature_payment_enabled',
-  'feature_open_accounts_enabled'
+  'feature_open_accounts_enabled',
+  'feature_registration_enabled'
 ]
 
 const DEFAULT_FEATURE_FLAGS = Object.freeze({
   xhs: true,
   xianyu: true,
   payment: true,
-  openAccounts: true
+  openAccounts: true,
+  registration: true
 })
 
 const CACHE_TTL_MS = 30 * 1000
@@ -66,7 +68,8 @@ export async function getFeatureFlags(db, { forceRefresh = false } = {}) {
     xhs: resolveEnabled('feature_xhs_enabled', DEFAULT_FEATURE_FLAGS.xhs),
     xianyu: resolveEnabled('feature_xianyu_enabled', DEFAULT_FEATURE_FLAGS.xianyu),
     payment: resolveEnabled('feature_payment_enabled', DEFAULT_FEATURE_FLAGS.payment),
-    openAccounts: resolveEnabled('feature_open_accounts_enabled', DEFAULT_FEATURE_FLAGS.openAccounts)
+    openAccounts: resolveEnabled('feature_open_accounts_enabled', DEFAULT_FEATURE_FLAGS.openAccounts),
+    registration: resolveEnabled('feature_registration_enabled', DEFAULT_FEATURE_FLAGS.registration)
   }
   cachedAt = now
   return cachedFlags
@@ -80,6 +83,7 @@ export const isFeatureEnabled = (flags, featureKey) => {
   if (normalized === 'xianyu') return Boolean(map.xianyu)
   if (normalized === 'payment') return Boolean(map.payment)
   if (normalized === 'openAccounts') return Boolean(map.openAccounts)
+  if (normalized === 'registration') return Boolean(map.registration)
   return true
 }
 

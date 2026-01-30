@@ -1,13 +1,17 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { authService } from '@/services/api'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { useAppConfigStore } from '@/stores/appConfig'
 
 const router = useRouter()
 const route = useRoute()
+const appConfigStore = useAppConfigStore()
+
+const registrationEnabled = computed(() => appConfigStore.features.registration !== false)
 
 const email = ref('')
 const code = ref('')
@@ -137,7 +141,23 @@ const handleRegister = async () => {
     </div>
 
     <div class="relative z-10 w-full max-w-[440px] mx-4">
-      <div class="relative overflow-hidden rounded-3xl bg-white/40 backdrop-blur-xl border border-white/50 shadow-[0_8px_32px_rgba(0,0,0,0.05)] p-8 md:p-10 transition-all duration-500 hover:shadow-[0_8px_40px_rgba(0,0,0,0.08)]">
+      <!-- 注册功能已关闭提示 -->
+      <div v-if="!registrationEnabled" class="relative overflow-hidden rounded-3xl bg-white/40 backdrop-blur-xl border border-white/50 shadow-[0_8px_32px_rgba(0,0,0,0.05)] p-8 md:p-10">
+        <div class="text-center space-y-4">
+          <h1 class="text-2xl font-semibold text-gray-900">注册功能已关闭</h1>
+          <p class="text-gray-500">管理员已暂停新用户注册，如需账号请联系管理员。</p>
+          <Button
+            type="button"
+            class="w-full h-12 rounded-2xl bg-gray-900 hover:bg-gray-800 text-white font-medium"
+            @click="router.push('/login')"
+          >
+            返回登录
+          </Button>
+        </div>
+      </div>
+
+      <!-- 正常注册表单 -->
+      <div v-else class="relative overflow-hidden rounded-3xl bg-white/40 backdrop-blur-xl border border-white/50 shadow-[0_8px_32px_rgba(0,0,0,0.05)] p-8 md:p-10 transition-all duration-500 hover:shadow-[0_8px_40px_rgba(0,0,0,0.08)]">
         <div class="mb-8 text-center">
           <h1 class="text-3xl font-semibold text-gray-900 tracking-tight mb-2">创建账号</h1>
           <p class="text-sm text-gray-500 font-medium">使用邮箱完成注册</p>

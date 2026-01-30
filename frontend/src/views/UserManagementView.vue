@@ -302,6 +302,58 @@ const confirmDeleteUser = async () => {
   }
 }
 
+// 新增用户
+const createDialogOpen = ref(false)
+const createUsername = ref('')
+const createEmail = ref('')
+const createPassword = ref('')
+const createRoleKey = ref('user')
+const createInviteEnabled = ref(true)
+const createLoading = ref(false)
+
+const openCreateDialog = () => {
+  createUsername.value = ''
+  createEmail.value = ''
+  createPassword.value = ''
+  createRoleKey.value = 'user'
+  createInviteEnabled.value = true
+  createDialogOpen.value = true
+}
+
+const closeCreateDialog = () => {
+  createDialogOpen.value = false
+  createUsername.value = ''
+  createEmail.value = ''
+  createPassword.value = ''
+  createRoleKey.value = 'user'
+  createInviteEnabled.value = true
+}
+
+const confirmCreateUser = async () => {
+  error.value = ''
+  success.value = ''
+  createLoading.value = true
+
+  try {
+    await adminService.createUser({
+      username: createUsername.value.trim(),
+      email: createEmail.value.trim(),
+      password: createPassword.value,
+      roleKey: createRoleKey.value,
+      inviteEnabled: createInviteEnabled.value,
+    })
+    showSuccessToast('用户创建成功')
+    closeCreateDialog()
+    await loadUsers()
+  } catch (err: any) {
+    const message = err.response?.data?.error || '创建用户失败'
+    error.value = message
+    showErrorToast(message)
+  } finally {
+    createLoading.value = false
+  }
+}
+
 const setPointsDialogOpen = ref(false)
 const setPointsUser = ref<RbacUser | null>(null)
 const setPointsExpected = ref<number | null>(null)
@@ -648,18 +700,28 @@ onMounted(async () => {
             @keyup.enter="handleSearch"
           />
         </div>
-        <Button
-          type="button"
-          variant="outline"
-          size="icon"
-          class="h-11 w-11 rounded-xl"
-          :disabled="listLoading"
-          :title="listLoading ? '刷新中...' : '刷新'"
-          aria-label="刷新"
-          @click="loadData"
-        >
-          <RefreshCw class="h-4 w-4" :class="{ 'animate-spin': listLoading }" />
-        </Button>
+        <div class="flex gap-2 items-center">
+          <Button
+            type="button"
+            class="h-11 px-4 rounded-xl"
+            :disabled="listLoading"
+            @click="openCreateDialog"
+          >
+            新增用户
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            size="icon"
+            class="h-11 w-11 rounded-xl"
+            :disabled="listLoading"
+            :title="listLoading ? '刷新中...' : '刷新'"
+            aria-label="刷新"
+            @click="loadData"
+          >
+            <RefreshCw class="h-4 w-4" :class="{ 'animate-spin': listLoading }" />
+          </Button>
+        </div>
       </div>
 
       <div v-if="error" class="rounded-2xl border border-red-100 bg-red-50/50 p-4 text-red-600">
@@ -1149,6 +1211,93 @@ onMounted(async () => {
                 @click="saveUserEdits"
               >
                 {{ editLoading ? '保存中...' : '保存' }}
+              </Button>
+            </div>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <!-- Create user dialog -->
+      <Dialog v-model:open="createDialogOpen" @update:open="(open) => { if (!open) closeCreateDialog() }">
+        <DialogContent class="sm:max-w-[520px] p-0 overflow-hidden bg-white border-none shadow-2xl rounded-3xl">
+          <DialogHeader class="px-8 pt-8 pb-4">
+            <DialogTitle class="text-2xl font-bold text-gray-900">新增用户</DialogTitle>
+            <DialogDescription class="text-gray-500">
+              创建新用户账号。
+            </DialogDescription>
+          </DialogHeader>
+          <div class="px-8 pb-4 space-y-4">
+            <div class="space-y-2">
+              <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">用户名</Label>
+              <Input
+                v-model="createUsername"
+                class="h-11 bg-gray-50 border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-100 focus:border-blue-500"
+                placeholder="请输入用户名"
+                :disabled="createLoading"
+              />
+            </div>
+            <div class="space-y-2">
+              <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">邮箱</Label>
+              <Input
+                v-model="createEmail"
+                type="email"
+                class="h-11 bg-gray-50 border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-100 focus:border-blue-500"
+                placeholder="请输入邮箱"
+                :disabled="createLoading"
+              />
+            </div>
+            <div class="space-y-2">
+              <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">密码</Label>
+              <Input
+                v-model="createPassword"
+                type="password"
+                class="h-11 bg-gray-50 border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-100 focus:border-blue-500"
+                placeholder="请输入密码（至少6位）"
+                :disabled="createLoading"
+              />
+            </div>
+            <div class="space-y-2">
+              <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">角色</Label>
+              <select
+                v-model="createRoleKey"
+                class="h-11 w-full rounded-xl border border-gray-200 bg-gray-50 px-3 text-sm text-gray-800 focus:outline-none focus:ring-2 focus:ring-blue-100"
+                :disabled="createLoading"
+              >
+                <option v-for="role in roles" :key="role.id" :value="role.roleKey">
+                  {{ role.roleName }} ({{ role.roleKey }})
+                </option>
+              </select>
+            </div>
+            <div class="space-y-2">
+              <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">邀请功能</Label>
+              <select
+                v-model="createInviteEnabled"
+                class="h-11 w-full rounded-xl border border-gray-200 bg-gray-50 px-3 text-sm text-gray-800 focus:outline-none focus:ring-2 focus:ring-blue-100"
+                :disabled="createLoading"
+              >
+                <option :value="true">开启</option>
+                <option :value="false">关闭</option>
+              </select>
+            </div>
+          </div>
+          <DialogFooter class="px-8 pb-8 pt-0">
+            <div class="flex items-center justify-end gap-3 w-full">
+              <Button
+                type="button"
+                variant="outline"
+                class="h-11 rounded-xl border-gray-200"
+                :disabled="createLoading"
+                @click="closeCreateDialog"
+              >
+                取消
+              </Button>
+              <Button
+                type="button"
+                class="h-11 rounded-xl bg-black hover:bg-gray-800 text-white"
+                :disabled="createLoading"
+                @click="confirmCreateUser"
+              >
+                {{ createLoading ? '创建中...' : '创建' }}
               </Button>
             </div>
           </DialogFooter>
