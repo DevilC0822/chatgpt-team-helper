@@ -13,6 +13,48 @@ router.use(requireFeatureEnabled('openAccounts'))
 
 router.use('/admin', authenticateToken, requireMenu('credit_orders'))
 
+router.get('/admin/orders/summary', async (req, res) => {
+  try {
+    const db = await getDatabase()
+    const search = (req.query.search || '').trim().toLowerCase()
+
+    const conditions = []
+    const params = []
+
+    if (search) {
+      conditions.push(`(LOWER(order_no) LIKE ? OR LOWER(uid) LIKE ? OR LOWER(username) LIKE ? OR LOWER(title) LIKE ?)`)
+      const searchPattern = `%${search}%`
+      params.push(searchPattern, searchPattern, searchPattern, searchPattern)
+    }
+
+    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
+
+    const result = db.exec(
+      `
+        SELECT
+          COUNT(*) AS total,
+          COALESCE(SUM(CASE WHEN status = 'paid' THEN 1 ELSE 0 END), 0) AS paid,
+          COALESCE(SUM(CASE WHEN status IN ('pending_payment', 'created') THEN 1 ELSE 0 END), 0) AS pending,
+          COALESCE(SUM(CASE WHEN status = 'refunded' THEN 1 ELSE 0 END), 0) AS refunded
+        FROM credit_orders
+        ${whereClause}
+      `,
+      params
+    )
+
+    const row = result[0]?.values?.[0] || [0, 0, 0, 0]
+    res.json({
+      total: Number(row[0] || 0),
+      paid: Number(row[1] || 0),
+      pending: Number(row[2] || 0),
+      refunded: Number(row[3] || 0)
+    })
+  } catch (error) {
+    console.error('[Credit] admin summary error:', error)
+    res.status(500).json({ error: '查询失败' })
+  }
+})
+
 const safeSnippet = (value, limit = 420) => {
   if (value == null) return ''
   const raw = typeof value === 'string' ? value : (() => {
@@ -160,8 +202,9 @@ const persistCreditQueryResult = (db, orderNo, queryResult) => {
 
 const shouldSyncCreditOrder = (order, { force = false } = {}) => {
   if (!order) return false
-  if (order.status === 'paid' || order.status === 'refunded' || order.status === 'expired' || order.status === 'failed') return false
+  if (order.refundedAt || order.status === 'refunded') return false
   if (force) return true
+  if (order.status === 'paid' || order.status === 'expired' || order.status === 'failed') return false
   const last = order.queryAt ? Date.parse(String(order.queryAt)) : 0
   const minIntervalMs = Math.max(2000, toInt(process.env.CREDIT_ORDER_QUERY_MIN_INTERVAL_MS, 8000))
   return !last || Number.isNaN(last) || Date.now() - last > minIntervalMs
@@ -493,6 +536,66 @@ router.post('/admin/orders/:orderNo/refund', async (req, res) => {
   } catch (error) {
     console.error('[Credit] admin refund error:', error)
     res.status(500).json({ error: '退款失败' })
+  }
+})
+
+router.post('/admin/orders/:orderNo/sync', async (req, res) => {
+  const orderNo = normalizeOrderNo(req.params.orderNo)
+  if (!orderNo) return res.status(400).json({ error: '缺少订单号' })
+
+  if (!creditGatewayServerQueryEnabled()) {
+    return res.status(400).json({ error: '已禁用 Credit 服务端查单，请联系管理员' })
+  }
+
+  const { pid, key } = await getCreditGatewayConfig()
+  if (!pid || !key) {
+    return res.status(500).json({ error: 'Credit 未配置，请联系管理员' })
+  }
+
+  try {
+    const db = await getDatabase()
+    const result = await withLocks([`credit:${orderNo}`], async () => {
+      const order = fetchCreditOrder(db, orderNo)
+      if (!order) return { ok: false, status: 404, error: '订单不存在' }
+      if (order.refundedAt || order.status === 'refunded') return { ok: false, status: 400, error: '订单已退款，无法更新' }
+
+      const syncResult = await syncCreditOrderStatusFromGateway(db, orderNo, { force: true })
+      const updated = fetchCreditOrder(db, orderNo) || order
+
+      if (!syncResult.ok) {
+        const msg =
+          syncResult.reason === 'money_mismatch'
+            ? '订单金额不一致，请人工核对'
+            : syncResult.reason === 'not_found'
+              ? 'Credit 未找到该订单'
+              : '同步失败'
+        return { ok: false, status: 502, error: msg }
+      }
+
+      const message = syncResult.skipped
+        ? '无需更新'
+        : syncResult.paid
+          ? '已更新为已完成'
+          : '订单未完成'
+
+      return {
+        ok: true,
+        message,
+        order: {
+          orderNo: updated.orderNo,
+          status: updated.status,
+          tradeNo: updated.tradeNo,
+          paidAt: updated.paidAt,
+          refundedAt: updated.refundedAt
+        }
+      }
+    })
+
+    if (!result.ok) return res.status(result.status || 400).json({ error: result.error })
+    res.json({ message: result.message, order: result.order })
+  } catch (error) {
+    console.error('[Credit] admin sync error:', error)
+    res.status(500).json({ error: '同步失败' })
   }
 })
 

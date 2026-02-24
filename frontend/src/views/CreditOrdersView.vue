@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, nextTick, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, nextTick, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { authService, creditService, type CreditAdminBalanceResponse, type CreditAdminOrder, type CreditAdminOrdersParams } from '@/services/api'
+import { authService, creditService, type CreditAdminBalanceResponse, type CreditAdminOrder, type CreditAdminOrdersParams, type CreditAdminOrdersSummaryResponse } from '@/services/api'
 import { formatShanghaiDate } from '@/lib/datetime'
 import { useAppConfigStore } from '@/stores/appConfig'
 import { Button } from '@/components/ui/button'
@@ -16,13 +16,15 @@ const { success: showSuccessToast, error: showErrorToast } = useToast()
 
 const orders = ref<CreditAdminOrder[]>([])
 const balance = ref<CreditAdminBalanceResponse | null>(null)
+const ordersSummary = ref<CreditAdminOrdersSummaryResponse | null>(null)
 const loading = ref(false)
 const error = ref('')
 const refundingOrderNo = ref<string | null>(null)
+const syncingOrderNo = ref<string | null>(null)
 const teleportReady = ref(false)
 
 // 分页相关状态（真实后端分页）
-const paginationMeta = ref({ page: 1, pageSize: 15, total: 0 })
+const paginationMeta = ref({ page: 1, pageSize: 10, total: 0 })
 
 // 搜索和筛选状态
 const searchQuery = ref('')
@@ -83,11 +85,22 @@ const getStatusColor = (status?: string) => {
 }
 
 const stats = computed(() => {
-  const total = orders.value.length
-  const paid = orders.value.filter(o => o.status === 'paid').length
-  const pending = orders.value.filter(o => o.status === 'pending_payment' || o.status === 'created').length
-  const refunded = orders.value.filter(o => o.status === 'refunded').length
-  return { total, paid, pending, refunded }
+  if (statusFilter.value !== 'all') {
+    const total = paginationMeta.value.total
+    return {
+      total,
+      paid: statusFilter.value === 'paid' ? total : 0,
+      pending: statusFilter.value === 'pending_payment' || statusFilter.value === 'created' ? total : 0,
+      refunded: statusFilter.value === 'refunded' ? total : 0
+    }
+  }
+
+  return {
+    total: ordersSummary.value?.total ?? paginationMeta.value.total,
+    paid: ordersSummary.value?.paid ?? 0,
+    pending: ordersSummary.value?.pending ?? 0,
+    refunded: ordersSummary.value?.refunded ?? 0
+  }
 })
 
 // 切换页码
@@ -98,45 +111,102 @@ const goToPage = (page: number) => {
 }
 
 // 执行搜索
-const applySearch = () => {
+const applySearch = async () => {
   const searchTerm = searchQuery.value.trim()
   appliedSearch.value = searchTerm
   paginationMeta.value.page = 1
-  loadOrders()
+  await Promise.all([loadOrders(), loadOrdersSummary()])
 }
 
 // 清空搜索和筛选
-const clearSearch = () => {
+const clearSearch = async () => {
   searchQuery.value = ''
   appliedSearch.value = ''
   statusFilter.value = 'all'
   paginationMeta.value.page = 1
-  loadOrders()
+  await Promise.all([loadOrders(), loadOrdersSummary()])
 }
 
 // 筛选状态变化
-const onStatusFilterChange = (value: string) => {
+const onStatusFilterChange = async (value: string) => {
   const validStatuses = ['all', 'created', 'pending_payment', 'paid', 'refunded', 'expired', 'failed'] as const
   if (validStatuses.includes(value as any)) {
     statusFilter.value = value as typeof statusFilter.value
     paginationMeta.value.page = 1
-    loadOrders()
+    await Promise.all([
+      loadOrders(),
+      value === 'all' ? loadOrdersSummary() : Promise.resolve()
+    ])
   }
 }
 
 const canRefund = (order: CreditAdminOrder) => order.status === 'paid' && !order.refundedAt
+const canSync = (order: CreditAdminOrder) => !['paid', 'refunded'].includes(order.status)
+
+const applyOrderUpdate = (updated: CreditAdminOrder) => {
+  const index = orders.value.findIndex(item => item.orderNo === updated.orderNo)
+  if (index === -1) return
+
+  const matchesFilter = statusFilter.value === 'all' || statusFilter.value === updated.status
+  if (!matchesFilter) {
+    orders.value = orders.value.filter(item => item.orderNo !== updated.orderNo)
+    paginationMeta.value = {
+      ...paginationMeta.value,
+      total: Math.max(0, paginationMeta.value.total - 1)
+    }
+    return
+  }
+
+  orders.value[index] = {
+    ...orders.value[index],
+    ...updated
+  }
+  orders.value = [...orders.value]
+}
+
+const syncOrderStatus = async (order: CreditAdminOrder) => {
+  if (!canSync(order)) return
+
+  syncingOrderNo.value = order.orderNo
+  try {
+    const resp = await creditService.adminSyncOrder(order.orderNo)
+    showSuccessToast(resp.message || '已同步')
+    await loadAll()
+  } catch (err: any) {
+    if (err?.response?.status === 401 || err?.response?.status === 403) {
+      authService.logout()
+      router.push('/login')
+      return
+    }
+    const message = err?.response?.data?.error || err?.message || '同步失败'
+    showErrorToast(message)
+  } finally {
+    syncingOrderNo.value = null
+  }
+}
 
 const refundOrder = async (order: CreditAdminOrder) => {
-  if (typeof window === 'undefined') return
   if (!canRefund(order)) return
-  const confirmed = window.confirm(`确定要退款订单 ${order.orderNo} 吗？该操作会将积分退回给用户。`)
-  if (!confirmed) return
 
   refundingOrderNo.value = order.orderNo
   try {
     const resp = await creditService.adminRefundOrder(order.orderNo)
- showSuccessToast(resp.message || '退款成功')
-    await loadAll()
+    showSuccessToast(resp.message || '退款成功')
+
+    // 只更新对应条目，避免整表刷新导致滚动/筛选状态抖动
+    applyOrderUpdate({
+      ...order,
+      status: 'refunded',
+      refundedAt: new Date().toISOString()
+    })
+    if (statusFilter.value === 'all' && ordersSummary.value) {
+      ordersSummary.value = {
+        ...ordersSummary.value,
+        paid: Math.max(0, ordersSummary.value.paid - 1),
+        refunded: ordersSummary.value.refunded + 1
+      }
+    }
+    await loadBalance()
   } catch (err: any) {
     if (err?.response?.status === 401 || err?.response?.status === 403) {
       authService.logout()
@@ -157,7 +227,7 @@ const loadOrders = async () => {
     const params = buildSearchParams()
     const ordersResp = await creditService.adminListOrders(params)
     orders.value = ordersResp.orders || []
-    paginationMeta.value = ordersResp.pagination || { page: 1, pageSize: 15, total: 0 }
+    paginationMeta.value = ordersResp.pagination || { page: 1, pageSize: 10, total: 0 }
   } catch (err: any) {
     if (err?.response?.status === 401 || err?.response?.status === 403) {
       authService.logout()
@@ -169,6 +239,23 @@ const loadOrders = async () => {
     showErrorToast(message)
   } finally {
     loading.value = false
+  }
+}
+
+const loadOrdersSummary = async () => {
+  try {
+    const search = appliedSearch.value.trim()
+    ordersSummary.value = await creditService.adminGetOrdersSummary({
+      search: search || undefined
+    })
+  } catch (err: any) {
+    if (err?.response?.status === 401 || err?.response?.status === 403) {
+      authService.logout()
+      router.push('/login')
+      return
+    }
+    // Summary is non-blocking; ignore errors.
+    ordersSummary.value = null
   }
 }
 
@@ -186,7 +273,7 @@ const loadBalance = async () => {
 }
 
 const loadAll = async () => {
-  await Promise.all([loadBalance(), loadOrders()])
+  await Promise.all([loadBalance(), loadOrders(), loadOrdersSummary()])
 }
 
 onMounted(async () => {
@@ -391,18 +478,31 @@ onUnmounted(() => {
                    <td class="px-6 py-5 text-sm text-gray-500 whitespace-nowrap">{{ formatDate(item.createdAt) }}</td>
                    <td class="px-6 py-5 text-sm text-gray-500 whitespace-nowrap">{{ formatDate(item.paidAt || null) }}</td>
                    <td class="px-6 py-5 text-right">
+                      <div class="flex items-center justify-end gap-2">
+                        <Button
+                          v-if="canSync(item)"
+                          variant="outline"
+                          size="sm"
+                          class="h-8 text-xs border-gray-200 hover:border-blue-200 hover:bg-blue-50 hover:text-blue-600 transition-colors"
+                          :disabled="syncingOrderNo === item.orderNo"
+                          @click="syncOrderStatus(item)"
+                        >
+                          <RefreshCw class="h-3 w-3 mr-1.5" :class="syncingOrderNo === item.orderNo ? 'animate-spin' : ''" />
+                          更新状态
+                        </Button>
                       <Button
-                         v-if="item.status === 'paid'"
+                         v-if="canRefund(item)"
                          variant="outline"
                          size="sm"
                          class="h-8 text-xs border-gray-200 hover:border-red-200 hover:bg-red-50 hover:text-red-600 transition-colors"
-                         :disabled="refundingOrderNo === item.orderNo"
+                         :disabled="refundingOrderNo === item.orderNo || syncingOrderNo === item.orderNo"
                          @click="refundOrder(item)"
                       >
                    <RotateCcw class="h-3 w-3 mr-1.5" :class="refundingOrderNo === item.orderNo ? 'animate-spin' : ''" />
                          退款
                       </Button>
-                      <span v-else class="text-gray-300 text-xs">-</span>
+                      <span v-if="!canRefund(item) && !canSync(item)" class="text-gray-300 text-xs">-</span>
+                      </div>
                    </td>
                 </tr>
              </tbody>

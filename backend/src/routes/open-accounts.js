@@ -238,7 +238,13 @@ const loadOrCreateLinuxDoUser = async (db, { uid, username }) => {
     [uid, username]
   )
   saveDatabase()
-  return { uid, username, email: '', currentOpenAccountId: null, currentOpenAccountEmail: '' }
+  return {
+    uid,
+    username,
+    email: '',
+    currentOpenAccountId: null,
+    currentOpenAccountEmail: ''
+  }
 }
 
 const updateLinuxDoUserCurrentAccount = (db, uid, username, accountId, openAccountEmail) => {
@@ -254,15 +260,14 @@ const ensureOpenAccount = (db, accountId) => {
   const result = db.exec(
     `
       SELECT id
-      FROM gpt_accounts
-      WHERE id = ?
-        AND is_open = 1
-        AND COALESCE(is_banned, 0) = 0
-        AND COALESCE(is_demoted, 0) = 0
-      LIMIT 1
-    `,
-    [accountId]
-  )
+	      FROM gpt_accounts
+	      WHERE id = ?
+	        AND is_open = 1
+	        AND COALESCE(is_banned, 0) = 0
+	      LIMIT 1
+	    `,
+	    [accountId]
+	  )
   return result.length > 0 && result[0].values.length > 0
 }
 
@@ -299,6 +304,13 @@ const getDailyBoardLimit = () => {
   return limit > 0 ? limit : 0 // 0 表示不限制
 }
 
+// 获取用户每日上车次数限制配置（全局 env）
+const isUserDailyBoardLimitEnabled = () => isEnabledFlag(process.env.OPEN_ACCOUNTS_USER_DAILY_BOARD_LIMIT_ENABLED, false)
+const getUserDailyBoardLimit = () => {
+  const limit = toInt(process.env.OPEN_ACCOUNTS_USER_DAILY_BOARD_LIMIT, 0)
+  return limit > 0 ? limit : 0 // 0 表示不限制
+}
+
 const getOpenAccountsVisibleCreatedWithinDays = () => {
   const days = toInt(process.env.OPEN_ACCOUNTS_VISIBLE_CREATED_WITHIN_DAYS, 30)
   return days > 0 ? days : 0 // 0 表示不限制
@@ -308,8 +320,7 @@ const OPEN_ACCOUNTS_REDEEM_BLOCK_START_HOUR = 0
 const OPEN_ACCOUNTS_REDEEM_BLOCK_END_HOUR = 8
 const ORDER_TYPE_WARRANTY = 'warranty'
 const ORDER_TYPE_NO_WARRANTY = 'no_warranty'
-const ORDER_TYPE_ANTI_BAN = 'anti_ban'
-const ORDER_TYPE_SET = new Set([ORDER_TYPE_WARRANTY, ORDER_TYPE_NO_WARRANTY, ORDER_TYPE_ANTI_BAN])
+const ORDER_TYPE_SET = new Set([ORDER_TYPE_WARRANTY, ORDER_TYPE_NO_WARRANTY])
 const normalizeOrderType = (value) => {
   const normalized = String(value || '').trim().toLowerCase()
   return ORDER_TYPE_SET.has(normalized) ? normalized : ORDER_TYPE_WARRANTY
@@ -357,6 +368,38 @@ const getTodayBoardCount = (db) => {
   return Number(result[0]?.values?.[0]?.[0] || 0)
 }
 
+// 查询用户今日已上车/占用次数（包含已上车 + 未过期的未完成订单 + 已支付未上车）
+const getUserTodayBoardOrderCount = (db, uid) => {
+  if (!db || !uid) return 0
+  const expireMinutes = Math.max(5, toInt(process.env.CREDIT_ORDER_EXPIRE_MINUTES, 15))
+  const threshold = `-${expireMinutes} minutes`
+  const result = db.exec(
+    `
+      SELECT COUNT(1)
+      FROM credit_orders
+      WHERE uid = ?
+        AND scene = 'open_accounts_board'
+        AND (
+          (
+            action_status = 'fulfilled'
+            AND DATE(updated_at) = DATE('now', 'localtime')
+          )
+          OR (
+            DATE(created_at) = DATE('now', 'localtime')
+            AND status IN ('created', 'pending_payment', 'paid')
+            AND (
+              status = 'paid'
+              OR paid_at IS NOT NULL
+              OR created_at >= DATETIME('now', 'localtime', ?)
+            )
+          )
+        )
+    `,
+    [uid, threshold]
+  )
+  return Number(result[0]?.values?.[0]?.[0] || 0)
+}
+
 // 获取已开放账号（卡片页展示用）
 router.get('/', authenticateLinuxDoSession, async (req, res) => {
   const uid = normalizeUid(req.linuxdo?.uid)
@@ -373,11 +416,15 @@ router.get('/', authenticateLinuxDoSession, async (req, res) => {
     // 获取规则配置
     const dailyLimit = getDailyBoardLimit()
     const creditCost = formatCreditMoney(process.env.OPEN_ACCOUNTS_CREDIT_COST || process.env.LINUXDO_OPEN_ACCOUNTS_CREDIT_COST || '10')
+    const userDailyLimitEnabled = isUserDailyBoardLimitEnabled() && getUserDailyBoardLimit() > 0
+    const userDailyLimit = userDailyLimitEnabled ? getUserDailyBoardLimit() : 0
 
     // 获取今日已上车人数
     const todayBoardCount = getTodayBoardCount(db)
 
-    // 获取用户本月上车次数
+    const userTodayBoardCount = uid ? getUserTodayBoardOrderCount(db, uid) : 0
+    const userDailyLimitRemaining =
+      userDailyLimitEnabled && userDailyLimit > 0 ? Math.max(0, userDailyLimit - userTodayBoardCount) : null
     const redeemBlockedHours = getOpenAccountsRedeemBlockedHours()
 
     const visibleWithinDays = getOpenAccountsVisibleCreatedWithinDays()
@@ -385,14 +432,13 @@ router.get('/', authenticateLinuxDoSession, async (req, res) => {
 
     const result = db.exec(
       `
-        SELECT ga.id,
-               ga.email,
-               COALESCE(ga.user_count, 0) AS user_count,
-               COALESCE(ga.invite_count, 0) AS invite_count,
-               ga.expire_at,
-               COALESCE(ga.is_demoted, 0) AS is_demoted,
-               code_stats.remaining_codes
-        FROM gpt_accounts ga
+	        SELECT ga.id,
+	               ga.email,
+	               COALESCE(ga.user_count, 0) AS user_count,
+	               COALESCE(ga.invite_count, 0) AS invite_count,
+	               ga.expire_at,
+	               code_stats.remaining_codes
+	        FROM gpt_accounts ga
         JOIN (
           SELECT lower(account_email) AS account_email_lower,
                  COUNT(*) AS remaining_codes
@@ -405,74 +451,57 @@ router.get('/', authenticateLinuxDoSession, async (req, res) => {
             AND (reserved_for_uid IS NULL OR reserved_for_uid = '')
           GROUP BY lower(account_email)
         ) code_stats ON lower(ga.email) = code_stats.account_email_lower
-        WHERE ga.is_open = 1
-          AND COALESCE(ga.is_banned, 0) = 0
-          AND (
-            CASE
-              WHEN COALESCE(ga.is_demoted, 0) = 1 THEN (COALESCE(ga.user_count, 0) + COALESCE(ga.invite_count, 0)) < 6
-              ELSE (COALESCE(ga.user_count, 0) + COALESCE(ga.invite_count, 0)) < 5
-            END
-          )
-          ${threshold ? "AND ga.created_at >= DATETIME('now', 'localtime', ?)" : ''}
-        ORDER BY ga.created_at DESC
-      `,
+	        WHERE ga.is_open = 1
+	          AND COALESCE(ga.is_banned, 0) = 0
+	          AND (COALESCE(ga.user_count, 0) + COALESCE(ga.invite_count, 0)) < 5
+	          ${threshold ? "AND ga.created_at >= DATETIME('now', 'localtime', ?)" : ''}
+	        ORDER BY ga.created_at DESC
+	      `,
       threshold ? [threshold] : []
     )
 
-    const rows = result[0]?.values || []
-    const items = rows.map(row => {
-      const email = row[1]
-      const emailPrefix = String(email || '').split('@')[0] || ''
-      const expireAt = row[4] ? String(row[4]) : null
-      const isDemoted = Number(row[5] || 0) === 1
-      const remainingCodes = Number(row[6] || 0)
-      const orderType = isDemoted ? ORDER_TYPE_ANTI_BAN : ORDER_TYPE_WARRANTY
-      const discounted = formatCreditMoney(calculateDiscountedCredit(creditCost, expireAt))
-      const finalCost = (() => {
-        if (!discounted) return null
-        if (!isDemoted) return discounted
-        const parsed = Number.parseFloat(discounted)
-        if (!Number.isFinite(parsed) || parsed <= 0) return null
-        const half = Math.max(1, Math.floor(parsed / 2))
-        return formatCreditMoney(half)
-      })()
-      return {
-        id: row[0],
-        emailPrefix,
-        joinedCount: Number(row[2]) || 0,
-        pendingCount: Number(row[3]) || 0,
-        expireAt,
-        remainingCodes,
-        isDemoted,
-        orderType,
-        creditCost: finalCost || discounted || creditCost || null
-      }
-    })
+	    const rows = result[0]?.values || []
+	    const items = rows.map(row => {
+	      const email = row[1]
+	      const emailPrefix = String(email || '').split('@')[0] || ''
+	      const expireAt = row[4] ? String(row[4]) : null
+	      const remainingCodes = Number(row[5] || 0)
+	      const orderType = ORDER_TYPE_WARRANTY
+	      const discounted = formatCreditMoney(calculateDiscountedCredit(creditCost, expireAt))
+	      return {
+	        id: row[0],
+	        emailPrefix,
+	        joinedCount: Number(row[2]) || 0,
+	        pendingCount: Number(row[3]) || 0,
+	        expireAt,
+	        remainingCodes,
+	        orderType,
+	        creditCost: discounted || creditCost || null
+	      }
+	    })
 
     if (currentAccountId && !items.some(item => Number(item.id) === currentAccountId)) {
-      const currentRow = db.exec(
-        `
-          SELECT id,
-                 email,
-                 COALESCE(user_count, 0) AS user_count,
-                 COALESCE(invite_count, 0) AS invite_count,
-                 expire_at,
-                 COALESCE(is_demoted, 0) AS is_demoted
-          FROM gpt_accounts
-          WHERE id = ?
-          LIMIT 1
-        `,
+	      const currentRow = db.exec(
+	        `
+	          SELECT id,
+	                 email,
+	                 COALESCE(user_count, 0) AS user_count,
+	                 COALESCE(invite_count, 0) AS invite_count,
+	                 expire_at
+	          FROM gpt_accounts
+	          WHERE id = ?
+	          LIMIT 1
+	        `,
         [currentAccountId]
       )[0]?.values?.[0]
 
-      if (currentRow) {
-        const email = currentRow[1]
-        const emailPrefix = String(email || '').split('@')[0] || ''
-        const expireAt = currentRow[4] ? String(currentRow[4]) : null
-        const isDemoted = Number(currentRow[5] || 0) === 1
-        const remainingResult = db.exec(
-          `
-            SELECT COUNT(*)
+	      if (currentRow) {
+	        const email = currentRow[1]
+	        const emailPrefix = String(email || '').split('@')[0] || ''
+	        const expireAt = currentRow[4] ? String(currentRow[4]) : null
+	        const remainingResult = db.exec(
+	          `
+	            SELECT COUNT(*)
             FROM redemption_codes
             WHERE is_redeemed = 0
               AND channel = 'linux-do'
@@ -483,32 +512,23 @@ router.get('/', authenticateLinuxDoSession, async (req, res) => {
               AND (reserved_for_uid IS NULL OR reserved_for_uid = '')
           `,
           [String(email || '').trim().toLowerCase()]
-        )
-        const remainingCodes = Number(remainingResult[0]?.values?.[0]?.[0] || 0)
-        const orderType = isDemoted ? ORDER_TYPE_ANTI_BAN : ORDER_TYPE_WARRANTY
-        const discounted = formatCreditMoney(calculateDiscountedCredit(creditCost, expireAt))
-        const finalCost = (() => {
-          if (!discounted) return null
-          if (!isDemoted) return discounted
-          const parsed = Number.parseFloat(discounted)
-          if (!Number.isFinite(parsed) || parsed <= 0) return null
-          const half = Math.max(1, Math.floor(parsed / 2))
-          return formatCreditMoney(half)
-        })()
+	        )
+	        const remainingCodes = Number(remainingResult[0]?.values?.[0]?.[0] || 0)
+	        const orderType = ORDER_TYPE_WARRANTY
+	        const discounted = formatCreditMoney(calculateDiscountedCredit(creditCost, expireAt))
 
-        items.unshift({
-          id: currentRow[0],
-          emailPrefix,
-          joinedCount: Number(currentRow[2]) || 0,
-          pendingCount: Number(currentRow[3]) || 0,
-          expireAt,
-          remainingCodes,
-          isDemoted,
-          orderType,
-          creditCost: finalCost || discounted || creditCost || null
-        })
-      }
-    }
+	        items.unshift({
+	          id: currentRow[0],
+	          emailPrefix,
+	          joinedCount: Number(currentRow[2]) || 0,
+	          pendingCount: Number(currentRow[3]) || 0,
+	          expireAt,
+	          remainingCodes,
+	          orderType,
+	          creditCost: discounted || creditCost || null
+	        })
+	      }
+	    }
 
     res.json({
       items,
@@ -517,6 +537,10 @@ router.get('/', authenticateLinuxDoSession, async (req, res) => {
         creditCost,
         dailyLimit: dailyLimit || null,
         todayBoardCount,
+        userDailyLimitEnabled,
+        userDailyLimit: userDailyLimitEnabled && userDailyLimit > 0 ? userDailyLimit : null,
+        userTodayBoardCount,
+        userDailyLimitRemaining,
         redeemBlockedHours,
         redeemBlockedNow: isOpenAccountsRedeemBlockedNow(),
         redeemBlockedMessage: buildOpenAccountsRedeemBlockedMessage()
@@ -569,36 +593,28 @@ router.post('/:accountId/board', authenticateLinuxDoSession, async (req, res) =>
       const currentId = freshUser.currentOpenAccountId ? Number(freshUser.currentOpenAccountId) : null
       const onboardedEmailForExitCheck = normalizeEmail(freshUser.currentOpenAccountEmail || freshUser.email || profileEmail)
 
-      const accountRow = db.exec(
-        `
-          SELECT id, email, expire_at, COALESCE(is_demoted, 0) AS is_demoted
-          FROM gpt_accounts
-          WHERE id = ?
-            AND is_open = 1
-            AND COALESCE(is_banned, 0) = 0
+	      const accountRow = db.exec(
+	        `
+	          SELECT id, email, expire_at
+	          FROM gpt_accounts
+	          WHERE id = ?
+	            AND is_open = 1
+	            AND COALESCE(is_banned, 0) = 0
           LIMIT 1
         `,
         [accountId]
       )[0]?.values?.[0]
       if (!accountRow) {
         return { type: 'error', status: 404, error: '开放账号不存在或已隐藏' }
-      }
-      const accountEmail = accountRow[1] ? String(accountRow[1]) : ''
-      const accountExpireAt = accountRow[2] ? String(accountRow[2]) : null
-      const isDemoted = Number(accountRow[3] || 0) === 1
-      const requestedOrderType = isDemoted ? ORDER_TYPE_ANTI_BAN : ORDER_TYPE_WARRANTY
-      const discounted = formatCreditMoney(calculateDiscountedCredit(creditCost, accountExpireAt))
-      const actualCreditCost = (() => {
-        if (!discounted) return null
-        if (!isDemoted) return discounted
-        const parsed = Number.parseFloat(discounted)
-        if (!Number.isFinite(parsed) || parsed <= 0) return null
-        const half = Math.max(1, Math.floor(parsed / 2))
-        return formatCreditMoney(half)
-      })()
-      if (!accountEmail) {
-        return { type: 'error', status: 500, error: '开放账号缺少邮箱配置' }
-      }
+	      }
+	      const accountEmail = accountRow[1] ? String(accountRow[1]) : ''
+	      const accountExpireAt = accountRow[2] ? String(accountRow[2]) : null
+	      const discounted = formatCreditMoney(calculateDiscountedCredit(creditCost, accountExpireAt))
+	      const actualCreditCost = discounted || creditCost || null
+	      const requestedOrderType = ORDER_TYPE_WARRANTY
+	      if (!accountEmail) {
+	        return { type: 'error', status: 500, error: '开放账号缺少邮箱配置' }
+	      }
 
       let verifiedCreditOrderNo = null
       let verifiedOrderType = requestedOrderType
@@ -621,20 +637,12 @@ router.post('/:accountId/board', authenticateLinuxDoSession, async (req, res) =>
         if (String(status) !== 'paid') return { type: 'error', status: 400, error: 'Credit 订单未完成授权' }
         if (Number(targetAccountId) !== accountId) return { type: 'error', status: 400, error: 'Credit 订单账号不匹配' }
 
-        verifiedCreditOrderNo = creditOrderNo
-        orderEmail = resolveCreditOrderEmail(db, creditOrderNo, orderEmailRaw || freshUser.email || profileEmail)
-        try {
-          const parsedPayload = actionPayload ? JSON.parse(String(actionPayload)) : null
-          const normalized = normalizeOrderType(parsedPayload?.orderType || parsedPayload?.order_type)
-          if (normalized) {
-            verifiedOrderType = normalized
-          }
-        } catch {
-        }
+	        verifiedCreditOrderNo = creditOrderNo
+	        orderEmail = resolveCreditOrderEmail(db, creditOrderNo, orderEmailRaw || freshUser.email || profileEmail)
 
-        if (actionStatus && String(actionStatus) === 'fulfilled' && actionResult) {
-          try {
-            const parsed = JSON.parse(String(actionResult))
+	        if (actionStatus && String(actionStatus) === 'fulfilled' && actionResult) {
+	          try {
+	            const parsed = JSON.parse(String(actionResult))
             if (parsed && typeof parsed === 'object') {
               return { type: 'success', body: parsed }
             }
@@ -732,15 +740,15 @@ router.post('/:accountId/board', authenticateLinuxDoSession, async (req, res) =>
           if (!creditPid || !creditKey) {
             return { type: 'error', status: 500, error: '未配置 Linux DO Credit 凭据' }
           }
-          if (!actualCreditCost) {
-            return { type: 'error', status: 500, error: '未配置上车所需积分' }
-          }
+	          if (!actualCreditCost) {
+	            return { type: 'error', status: 500, error: '未配置上车所需积分' }
+	          }
 
-          const baseCapacity = isDemoted ? 6 : 5
-          // 若用户尚未在目标账号的成员/邀请列表中，且账号已满员，则不创建订单，避免授权后无法上车。
-          if (!isMember && !isInvited) {
-            const seatsUsed = Number(account.userCount || 0) + Number(account.inviteCount || 0)
-            if (seatsUsed >= baseCapacity) {
+	          const baseCapacity = 5
+	          // 若用户尚未在目标账号的成员/邀请列表中，且账号已满员，则不创建订单，避免授权后无法上车。
+	          if (!isMember && !isInvited) {
+	            const seatsUsed = Number(account.userCount || 0) + Number(account.inviteCount || 0)
+	            if (seatsUsed >= baseCapacity) {
               return { type: 'error', status: 409, error: '该账号已满员，无法上车' }
             }
           }
@@ -804,6 +812,16 @@ router.post('/:accountId/board', authenticateLinuxDoSession, async (req, res) =>
             }
           }
 
+          // 检查用户每日上车次数限制（包含未完成订单，避免高并发时超额）
+          const userDailyLimitEnabled = isUserDailyBoardLimitEnabled()
+          const userDailyLimit = userDailyLimitEnabled ? getUserDailyBoardLimit() : 0
+          if (userDailyLimitEnabled && userDailyLimit > 0) {
+            const userTodayCount = getUserTodayBoardOrderCount(db, uid)
+            if (userTodayCount >= userDailyLimit) {
+              return { type: 'error', status: 429, error: `今日购买次数已达上限（${userDailyLimit}次），请明天再试` }
+            }
+          }
+
           // 检查今日全局上车人数限制（包含未完成订单，避免高并发时超额）
           const dailyLimit = getDailyBoardLimit()
           if (dailyLimit > 0) {
@@ -861,12 +879,12 @@ router.post('/:accountId/board', authenticateLinuxDoSession, async (req, res) =>
           }
         }
 
-        const baseCapacity = isDemoted ? 6 : 5
-        const redeemCapacity = isMember || isInvited ? Math.max(baseCapacity, 6) : baseCapacity
-        const redeemOutcome = await redeemOpenAccountsOrderCode(db, {
-          orderNo: verifiedCreditOrderNo,
-          uid,
-          email: orderEmail,
+	        const baseCapacity = 5
+	        const redeemCapacity = isMember || isInvited ? 6 : baseCapacity
+	        const redeemOutcome = await redeemOpenAccountsOrderCode(db, {
+	          orderNo: verifiedCreditOrderNo,
+	          uid,
+	          email: orderEmail,
           accountEmail,
           capacityLimit: redeemCapacity,
           orderType: verifiedOrderType

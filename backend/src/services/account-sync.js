@@ -78,22 +78,21 @@ function mapRowToAccount(row) {
     oaiDeviceId: row[7],
     expireAt: row[8] || null,
     isOpen: Boolean(row[9]),
-    isDemoted: Boolean(row[10]),
-    isBanned: Boolean(row[11]),
-    createdAt: row[12],
-    updatedAt: row[13]
+    isDemoted: false,
+    isBanned: Boolean(row[10]),
+    createdAt: row[11],
+    updatedAt: row[12]
   }
 }
 
 async function fetchAccountById(db, accountId) {
   const result = db.exec(
     `
-    SELECT id, email, token, refresh_token, user_count, invite_count, chatgpt_account_id, oai_device_id, expire_at, is_open,
-           COALESCE(is_demoted, 0) AS is_demoted,
-           COALESCE(is_banned, 0) AS is_banned,
-           created_at, updated_at
-    FROM gpt_accounts
-    WHERE id = ?
+	    SELECT id, email, token, refresh_token, user_count, invite_count, chatgpt_account_id, oai_device_id, expire_at, is_open,
+	           COALESCE(is_banned, 0) AS is_banned,
+	           created_at, updated_at
+	    FROM gpt_accounts
+	    WHERE id = ?
   `,
     [accountId]
   )
@@ -106,14 +105,13 @@ async function fetchAccountById(db, accountId) {
 }
 
 export async function fetchAllAccounts() {
-  const db = await getDatabase()
-  const result = db.exec(`
-    SELECT id, email, token, refresh_token, user_count, invite_count, chatgpt_account_id, oai_device_id, expire_at, is_open,
-           COALESCE(is_demoted, 0) AS is_demoted,
-           COALESCE(is_banned, 0) AS is_banned,
-           created_at, updated_at
-    FROM gpt_accounts
-    ORDER BY created_at DESC
+	  const db = await getDatabase()
+	  const result = db.exec(`
+	    SELECT id, email, token, refresh_token, user_count, invite_count, chatgpt_account_id, oai_device_id, expire_at, is_open,
+	           COALESCE(is_banned, 0) AS is_banned,
+	           created_at, updated_at
+	    FROM gpt_accounts
+	    ORDER BY created_at DESC
   `)
 
   if (result.length === 0) {
@@ -284,6 +282,68 @@ const parseJsonOrThrow = (text, { logContext, message }) => {
     console.error(message, logContext, error)
     throw new AccountSyncError(message, 500)
   }
+}
+
+export async function fetchOpenAiAccountInfo(token, proxy = null) {
+  const normalizedToken = String(token || '').trim().replace(/^Bearer\s+/i, '')
+  if (!normalizedToken) {
+    throw new AccountSyncError('缺少 access token', 400)
+  }
+
+  const apiUrl = 'https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27'
+  const headers = {
+    accept: '*/*',
+    'accept-language': 'zh-CN,zh;q=0.9',
+    authorization: `Bearer ${normalizedToken}`,
+    'oai-client-version': 'prod-eddc2f6ff65fee2d0d6439e379eab94fe3047f72',
+    'oai-language': 'zh-CN',
+    'user-agent':
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36'
+  }
+
+  const logContext = { url: apiUrl }
+  const { status, text } = await requestChatgptText(
+    apiUrl,
+    { method: 'GET', headers, proxy },
+    logContext
+  )
+
+  if (status < 200 || status >= 300) {
+    if (status === 401) {
+      throw new AccountSyncError('Token 已过期或无效', 401)
+    }
+    throw new AccountSyncError(`OpenAI API 请求失败: ${status}`, status || 500)
+  }
+
+  const data = parseJsonOrThrow(text, { logContext, message: 'OpenAI 接口返回格式异常' })
+  const accountsMap = data?.accounts && typeof data.accounts === 'object' ? data.accounts : {}
+  const ordering = Array.isArray(data?.account_ordering) ? data.account_ordering : []
+
+  const orderedIds = ordering
+    .filter(id => typeof id === 'string')
+    .filter(id => Object.prototype.hasOwnProperty.call(accountsMap, id))
+
+  const fallbackIds = Object.keys(accountsMap).filter(id => !orderedIds.includes(id))
+  const accountIds = [...orderedIds, ...fallbackIds].filter(id => id && id !== 'default')
+
+  if (accountIds.length === 0) {
+    throw new AccountSyncError('未找到关联的 ChatGPT 账号', 404)
+  }
+
+	  // Only keep team accounts (for workspace invite/admin operations).
+	  return accountIds
+	    .map(id => {
+	      const acc = accountsMap[id]
+	      return {
+	        accountId: id,
+	        name: acc?.account?.name || 'Unnamed Team',
+	        planType: acc?.account?.plan_type || null,
+	        expiresAt: acc?.entitlement?.expires_at || null,
+	        hasActiveSubscription: !!acc?.entitlement?.has_active_subscription,
+	        isDemoted: false
+	      }
+	    })
+	    .filter(acc => acc.planType === 'team')
 }
 
 const throwChatgptApiStatusError = async ({ status, errorText, logContext, label }) => {

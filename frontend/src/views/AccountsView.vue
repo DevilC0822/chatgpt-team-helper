@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, computed, onUnmounted, nextTick, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { authService, gptAccountService, type GptAccount, type CreateGptAccountDto, type SyncUserCountResponse, type GptAccountsListParams, type ChatgptAccountInviteItem } from '@/services/api'
+import { API_URL, authService, gptAccountService, openaiOAuthService, userService, type AccountStatus, type CheckAccountStatusItem, type CheckAccountStatusResponse, type GptAccount, type CreateGptAccountDto, type SyncUserCountResponse, type GptAccountsListParams, type ChatgptAccountInviteItem, type ChatgptAccountCheckInfo, type OpenAIOAuthSession, type OpenAIOAuthExchangeResult } from '@/services/api'
 import { formatShanghaiDate } from '@/lib/datetime'
 import { useAppConfigStore } from '@/stores/appConfig'
 import {
@@ -42,7 +42,7 @@ const paginationMeta = ref({ page: 1, pageSize: 10, total: 0 })
 const searchQuery = ref('')
 const openStatusFilter = ref<'all' | 'open' | 'closed'>('all')
 let searchDebounceTimer: ReturnType<typeof setTimeout> | null = null
-const { success: showSuccessToast, error: showErrorToast } = useToast()
+const { success: showSuccessToast, error: showErrorToast, warning: showWarningToast, info: showInfoToast } = useToast()
 const appConfigStore = useAppConfigStore()
 const dateFormatOptions = computed(() => ({
   timeZone: appConfigStore.timezone,
@@ -71,6 +71,10 @@ onUnmounted(() => {
     clearTimeout(searchDebounceTimer)
     searchDebounceTimer = null
   }
+  if (checkAbortController) {
+    checkAbortController.abort()
+    checkAbortController = null
+  }
   cancelResyncAfterAction()
 })
 
@@ -92,6 +96,19 @@ const inviting = ref(false)
 const togglingOpenAccountId = ref<number | null>(null)
 const banningAccountId = ref<number | null>(null)
 
+// 批量检查相关状态
+type CheckResultFilter = 'all' | 'abnormal' | 'banned' | 'expired' | 'normal' | 'failed'
+const showCheckDialog = ref(false)
+const checkRangeDays = ref<'7' | '15' | '30'>('7')
+const checking = ref(false)
+const checkProgress = ref(0)
+const checkTotal = ref<number | null>(null)
+const checkProcessed = ref(0)
+const checkError = ref('')
+const checkResult = ref<CheckAccountStatusResponse | null>(null)
+const resultFilter = ref<CheckResultFilter>('abnormal')
+let checkAbortController: AbortController | null = null
+
 // Tab 和 邀请列表状态
 const activeTab = ref<'members' | 'invites'>('members')
 const invitesList = ref<ChatgptAccountInviteItem[]>([])
@@ -106,12 +123,249 @@ const formData = ref<CreateGptAccountDto>({
   token: '',
   refreshToken: '',
   userCount: 0,
-  isDemoted: false,
   isBanned: false,
   chatgptAccountId: '',
   oaiDeviceId: '',
   expireAt: ''
 })
+
+const checkingAccessToken = ref(false)
+const checkedChatgptAccounts = ref<ChatgptAccountCheckInfo[]>([])
+const checkAccessTokenError = ref('')
+
+// OpenAI OAuth: 从授权码获取 refresh token（会话有效期 10 分钟）
+const showOpenaiOAuthPanel = ref(false)
+const openaiOAuthSession = ref<OpenAIOAuthSession | null>(null)
+const openaiOAuthResult = ref<OpenAIOAuthExchangeResult | null>(null)
+const openaiOAuthInput = ref('')
+const openaiOAuthError = ref('')
+const generatingOpenaiAuthUrl = ref(false)
+const exchangingOpenaiCode = ref(false)
+const cachedApiKey = ref<string>('')
+const cachedApiKeyConfigured = ref<boolean | null>(null)
+let openaiOAuthFlowNonce = 0
+
+const resolveRequestError = (err: any, fallback: string) => {
+  return (
+    err?.response?.data?.error ||
+    err?.response?.data?.message ||
+    err?.message ||
+    fallback
+  )
+}
+
+const ensureSystemApiKey = async (): Promise<string | null> => {
+  if (cachedApiKey.value) return cachedApiKey.value
+
+  try {
+    const result = await userService.getApiKey()
+    const apiKey = typeof result?.apiKey === 'string' ? result.apiKey.trim() : ''
+    cachedApiKeyConfigured.value = typeof result?.configured === 'boolean' ? result.configured : null
+    if (!apiKey) return null
+    cachedApiKey.value = apiKey
+    return apiKey
+  } catch (err) {
+    cachedApiKeyConfigured.value = null
+    return null
+  }
+}
+
+const resetOpenaiOAuthFlow = () => {
+  openaiOAuthFlowNonce += 1
+  showOpenaiOAuthPanel.value = false
+  openaiOAuthSession.value = null
+  openaiOAuthResult.value = null
+  openaiOAuthInput.value = ''
+  openaiOAuthError.value = ''
+  generatingOpenaiAuthUrl.value = false
+  exchangingOpenaiCode.value = false
+}
+
+const copyText = async (value: string, successMessage: string) => {
+  if (!value) return
+  try {
+    await navigator.clipboard.writeText(value)
+    showInfoToast(successMessage)
+  } catch (error) {
+    console.error('Copy failed', error)
+    showErrorToast('复制失败，请手动复制')
+  }
+}
+
+const extractOAuthCode = (value: string): string => {
+  const raw = String(value || '').trim()
+  if (!raw) return ''
+
+  try {
+    const url = new URL(raw)
+    const code = url.searchParams.get('code')
+    if (code) return code
+  } catch {
+    // ignore
+  }
+
+  const match = raw.match(/[?&]code=([^&#]+)/)
+  if (match?.[1]) {
+    try {
+      return decodeURIComponent(match[1])
+    } catch {
+      return match[1]
+    }
+  }
+
+  return raw
+}
+
+const generateOpenaiAuthUrl = async () => {
+  const currentNonce = openaiOAuthFlowNonce
+  openaiOAuthError.value = ''
+  openaiOAuthResult.value = null
+  openaiOAuthInput.value = ''
+
+  const apiKey = await ensureSystemApiKey()
+  if (!apiKey) {
+    const message =
+      cachedApiKeyConfigured.value === false
+        ? '系统未配置 API Key，请先到「系统设置」配置后再试'
+        : '获取 API Key 失败（需要系统设置权限）'
+    openaiOAuthError.value = message
+    showErrorToast(message)
+    return
+  }
+
+  try {
+    generatingOpenaiAuthUrl.value = true
+    const session = await openaiOAuthService.generateAuthUrl(apiKey)
+    if (currentNonce !== openaiOAuthFlowNonce) return
+    openaiOAuthSession.value = session
+    showOpenaiOAuthPanel.value = true
+  } catch (err: any) {
+    if (currentNonce !== openaiOAuthFlowNonce) return
+    openaiOAuthError.value = resolveRequestError(err, '生成授权链接失败')
+    showErrorToast(openaiOAuthError.value)
+  } finally {
+    if (currentNonce === openaiOAuthFlowNonce) {
+      generatingOpenaiAuthUrl.value = false
+    }
+  }
+}
+
+const handleClickGetRefreshToken = async () => {
+  showOpenaiOAuthPanel.value = true
+  if (openaiOAuthSession.value?.authUrl && openaiOAuthSession.value?.sessionId) return
+  await generateOpenaiAuthUrl()
+}
+
+const handleOpenAuthUrl = () => {
+  const url = String(openaiOAuthSession.value?.authUrl || '').trim()
+  if (!url) return
+  try {
+    window.open(url, '_blank', 'noopener,noreferrer')
+  } catch (error) {
+    console.error('Open auth url failed', error)
+    showErrorToast('打开失败，请复制链接到浏览器打开')
+  }
+}
+
+const handleExchangeOpenaiCode = async () => {
+  const currentNonce = openaiOAuthFlowNonce
+  const sessionId = String(openaiOAuthSession.value?.sessionId || '').trim()
+  if (!sessionId) {
+    showErrorToast('请先点击“获取”生成授权链接')
+    return
+  }
+
+  const code = extractOAuthCode(openaiOAuthInput.value)
+  if (!code) {
+    showErrorToast('请粘贴回调 URL 或授权码（code）')
+    return
+  }
+
+  const apiKey = await ensureSystemApiKey()
+  if (!apiKey) {
+    const message = '获取 API Key 失败（需要系统设置权限）'
+    openaiOAuthError.value = message
+    showErrorToast(message)
+    return
+  }
+
+  try {
+    exchangingOpenaiCode.value = true
+    openaiOAuthError.value = ''
+    const result = await openaiOAuthService.exchangeCode(apiKey, { code, sessionId })
+    if (currentNonce !== openaiOAuthFlowNonce) return
+    openaiOAuthResult.value = result
+
+    const accessToken = String(result?.tokens?.accessToken || '').trim()
+    const refreshToken = String(result?.tokens?.refreshToken || '').trim()
+    const accountId = String(result?.accountInfo?.accountId || '').trim()
+    const oauthEmail = String(result?.accountInfo?.email || '').trim()
+
+    if (accessToken) {
+      formData.value.token = accessToken
+    }
+    if (refreshToken) {
+      formData.value.refreshToken = refreshToken
+    } else {
+      showWarningToast('未返回 refresh token（可能未授予 offline_access），请确认授权 scope')
+    }
+    if (accountId) {
+      const existingAccountId = String(formData.value.chatgptAccountId || '').trim()
+      if (!existingAccountId) {
+        formData.value.chatgptAccountId = accountId
+      } else if (existingAccountId !== accountId) {
+        showWarningToast(`授权返回的 ChatGPT ID 为 ${accountId}，与表单不一致，请确认是否填错`)
+      }
+    }
+    if (oauthEmail) {
+      if (!String(formData.value.email || '').trim()) {
+        formData.value.email = oauthEmail
+      } else if (String(formData.value.email || '').trim().toLowerCase() !== oauthEmail.toLowerCase()) {
+        showWarningToast(`授权账号邮箱为 ${oauthEmail}，与表单邮箱不一致，请确认是否填错`)
+      }
+    }
+
+    // OAuth 交换接口不会返回 Team 订阅到期时间；这里用 access token 额外拉一次账号信息，
+    // 尝试自动填充过期时间（entitlement.expires_at）。
+    if (accessToken) {
+      const alreadyChecking = checkingAccessToken.value
+      if (!alreadyChecking) {
+        checkingAccessToken.value = true
+      }
+      try {
+        const checked = await gptAccountService.checkAccessToken(accessToken)
+        if (currentNonce !== openaiOAuthFlowNonce) return
+
+        checkedChatgptAccounts.value = Array.isArray(checked?.accounts) ? checked.accounts : []
+        checkAccessTokenError.value = ''
+
+        const preferredId = String(formData.value.chatgptAccountId || accountId || '').trim()
+        if (preferredId) {
+          applyCheckedAccountSelection(preferredId)
+        }
+      } catch (err: any) {
+        if (currentNonce !== openaiOAuthFlowNonce) return
+        // 不阻塞主流程，失败时允许用户手动填写
+        const message = resolveRequestError(err, '获取账号到期时间失败')
+        checkAccessTokenError.value = message
+      } finally {
+        if (!alreadyChecking && currentNonce === openaiOAuthFlowNonce) {
+          checkingAccessToken.value = false
+        }
+      }
+    }
+
+    showSuccessToast('已获取并填入 token 信息')
+  } catch (err: any) {
+    if (currentNonce !== openaiOAuthFlowNonce) return
+    openaiOAuthError.value = resolveRequestError(err, '交换授权码失败')
+    showErrorToast(openaiOAuthError.value)
+  } finally {
+    if (currentNonce === openaiOAuthFlowNonce) {
+      exchangingOpenaiCode.value = false
+    }
+  }
+}
 
 // 转换存储格式 (YYYY/MM/DD HH:mm:ss) 为 datetime-local 格式 (YYYY-MM-DDTHH:mm:ss)
 const toDatetimeLocal = (expireAt: string): string => {
@@ -135,6 +389,148 @@ const fromDatetimeLocal = (datetimeLocal: string): string => {
     return `${year}/${month}/${day} ${hour}:${minute}:${second}`
   }
   return datetimeLocal // 如果不匹配，返回原值让后端处理
+}
+
+const pad2 = (value: number) => String(value).padStart(2, '0')
+const EXPIRE_AT_PARSE_REGEX = /^(\d{4})[/-](\d{1,2})[/-](\d{1,2})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?$/
+const parseExpireAtToMs = (value?: string | null): number | null => {
+  const raw = String(value ?? '').trim()
+  if (!raw) return null
+  const match = raw.match(EXPIRE_AT_PARSE_REGEX)
+  if (!match) return null
+
+  const year = Number(match[1])
+  const month = Number(match[2])
+  const day = Number(match[3])
+  const hour = Number(match[4])
+  const minute = Number(match[5])
+  const second = match[6] != null ? Number(match[6]) : 0
+
+  if (![year, month, day, hour, minute, second].every(Number.isFinite)) return null
+  if (month < 1 || month > 12) return null
+  if (day < 1 || day > 31) return null
+  if (hour < 0 || hour > 23) return null
+  if (minute < 0 || minute > 59) return null
+  if (second < 0 || second > 59) return null
+
+  // NOTE: expireAt is stored as Asia/Shanghai time.
+  const iso = `${match[1]}-${pad2(month)}-${pad2(day)}T${pad2(hour)}:${pad2(minute)}:${pad2(second)}+08:00`
+  const parsed = Date.parse(iso)
+  return Number.isNaN(parsed) ? null : parsed
+}
+
+const getAccountListStatus = (account: GptAccount): AccountStatus => {
+  if (account.isBanned) return 'banned'
+  const expireAtMs = parseExpireAtToMs(account.expireAt)
+  if (expireAtMs != null && expireAtMs < Date.now()) return 'expired'
+  return 'normal'
+}
+
+const STATUS_BADGE_MAP: Record<AccountStatus, { label: string; class: string }> = {
+  normal: { label: '正常', class: 'bg-emerald-50 text-emerald-700 border-emerald-200' },
+  expired: { label: '过期', class: 'bg-orange-50 text-orange-700 border-orange-200' },
+  banned: { label: '封号', class: 'bg-red-50 text-red-700 border-red-200' },
+  failed: { label: '失败', class: 'bg-gray-50 text-gray-700 border-gray-200' },
+}
+const statusBadge = (status: AccountStatus) => STATUS_BADGE_MAP[status] || STATUS_BADGE_MAP.normal
+
+const isoToDatetimeLocal = (isoString: string): string => {
+  const raw = String(isoString || '').trim()
+  if (!raw) return ''
+  const date = new Date(raw)
+  if (Number.isNaN(date.getTime())) return ''
+
+  try {
+    const parts = new Intl.DateTimeFormat('zh-CN', {
+      timeZone: appConfigStore.timezone || 'Asia/Shanghai',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false
+    }).formatToParts(date)
+    const get = (type: string) => parts.find(p => p.type === type)?.value || ''
+    const year = get('year')
+    const month = get('month')
+    const day = get('day')
+    const hour = get('hour')
+    const minute = get('minute')
+    const second = get('second') || '00'
+    if (year && month && day && hour && minute) {
+      return `${year}-${month}-${day}T${hour}:${minute}:${second}`
+    }
+  } catch {
+    // ignore and fallback to local time
+  }
+
+  const pad = (value: number) => String(value).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+}
+
+const applyCheckedAccountSelection = (accountId: string) => {
+  const normalized = String(accountId || '').trim()
+  if (!normalized) return
+
+  const matched = checkedChatgptAccounts.value.find(acc => acc.accountId === normalized)
+  if (!matched) return
+
+  if (matched.expiresAt) {
+    const localValue = isoToDatetimeLocal(matched.expiresAt)
+    if (localValue) {
+      formData.value.expireAt = localValue
+    }
+  }
+}
+
+const openChatgptIdDropdown = async () => {
+  await nextTick()
+  const el = document.getElementById('chatgpt-account-id-input') as HTMLInputElement | null
+  el?.focus()
+  try {
+    // Best-effort: trigger the browser's datalist dropdown.
+    el?.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown' }))
+  } catch {
+    // ignore
+  }
+}
+
+const handleCheckAccessToken = async () => {
+  const token = String(formData.value.token || '').trim()
+  if (!token) {
+    showErrorToast('请先填写 Access Token')
+    return
+  }
+
+  try {
+    checkingAccessToken.value = true
+    checkAccessTokenError.value = ''
+
+    const result = await gptAccountService.checkAccessToken(token)
+    checkedChatgptAccounts.value = Array.isArray(result?.accounts) ? result.accounts : []
+
+    if (!checkedChatgptAccounts.value.length) {
+      showErrorToast('校验成功，但未返回可用账号（可能没有 Team 账号权限）')
+      return
+    }
+
+    showSuccessToast(`校验成功：获取到 ${checkedChatgptAccounts.value.length} 个账号`)
+
+    // If user hasn't filled chatgptAccountId yet and there is only 1 option, autofill it.
+    if (!String(formData.value.chatgptAccountId || '').trim() && checkedChatgptAccounts.value.length === 1) {
+      formData.value.chatgptAccountId = checkedChatgptAccounts.value[0]?.accountId || ''
+    }
+
+    applyCheckedAccountSelection(formData.value.chatgptAccountId)
+    await openChatgptIdDropdown()
+  } catch (err: any) {
+    const message = err?.response?.data?.error || '校验失败'
+    checkAccessTokenError.value = message
+    showErrorToast(message)
+  } finally {
+    checkingAccessToken.value = false
+  }
 }
 
 // 切换页码
@@ -178,6 +574,318 @@ const loadAccounts = async () => {
   }
 }
 
+const handleRefresh = () => {
+  if (searchDebounceTimer) {
+    clearTimeout(searchDebounceTimer)
+    searchDebounceTimer = null
+  }
+  loadAccounts()
+}
+
+const openCheckDialog = () => {
+  checkError.value = ''
+  resultFilter.value = 'abnormal'
+  checkProgress.value = 0
+  checkTotal.value = null
+  checkProcessed.value = 0
+  checkResult.value = null
+  showCheckDialog.value = true
+}
+
+const closeCheckDialog = () => {
+  showCheckDialog.value = false
+  if (checkAbortController) {
+    checkAbortController.abort()
+    checkAbortController = null
+  }
+  checking.value = false
+  checkProgress.value = 0
+  checkTotal.value = null
+  checkProcessed.value = 0
+  checkError.value = ''
+  checkResult.value = null
+  resultFilter.value = 'abnormal'
+}
+
+watch(checkRangeDays, () => {
+  checkError.value = ''
+  checkResult.value = null
+  resultFilter.value = 'abnormal'
+  checkProgress.value = 0
+  checkTotal.value = null
+  checkProcessed.value = 0
+})
+
+const checkItems = computed<CheckAccountStatusItem[]>(() => {
+  const items = checkResult.value?.items
+  return Array.isArray(items) ? items : []
+})
+
+const filteredCheckItems = computed(() => {
+  const filter = resultFilter.value
+  const list = checkItems.value
+
+  if (filter === 'all') return list
+  if (filter === 'abnormal') return list.filter(item => item.status !== 'normal' || Boolean(item.refreshed))
+  return list.filter(item => item.status === filter)
+})
+
+const handleStartCheck = async () => {
+  checkError.value = ''
+  checkResult.value = null
+  resultFilter.value = 'abnormal'
+  checkProgress.value = 0
+  checkTotal.value = null
+  checkProcessed.value = 0
+
+  if (checkAbortController) {
+    checkAbortController.abort()
+    checkAbortController = null
+  }
+
+  try {
+    checking.value = true
+    const rangeDays = Number.parseInt(checkRangeDays.value, 10) as 7 | 15 | 30
+    const token = localStorage.getItem('token')
+    if (!token) {
+      throw new Error('登录已过期，请重新登录')
+    }
+
+    checkAbortController = new AbortController()
+    const streamUrl = `${API_URL}/gpt-accounts/check-status/stream?rangeDays=${rangeDays}`
+    const response = await fetch(streamUrl, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: 'text/event-stream'
+      },
+      signal: checkAbortController.signal
+    })
+
+    if (!response.ok) {
+      if (response.status === 401 || response.status === 403) {
+        authService.logout()
+        router.push('/login')
+      }
+      let message = '检查失败，请稍后重试'
+      try {
+        const data = await response.json()
+        message = data?.error || data?.message || message
+      } catch {
+        try {
+          const text = await response.text()
+          if (text) message = text
+        } catch {
+          // ignore
+        }
+      }
+      throw new Error(message)
+    }
+
+    if (!response.body) {
+      throw new Error('当前浏览器不支持流式响应')
+    }
+
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+    let doneReceived = false
+
+    const makeCheckResult = (payload: any): CheckAccountStatusResponse => {
+      const nextRangeDays = Number(payload?.rangeDays || rangeDays) as 7 | 15 | 30
+      const truncated = Boolean(payload?.truncated)
+      const skipped = Number(payload?.skipped || 0)
+      const total = Number(payload?.total || 0)
+
+      checkTotal.value = Number.isFinite(total) ? total : null
+      checkProcessed.value = 0
+      checkProgress.value = total ? 0 : 100
+
+      return {
+        message: 'ok',
+        rangeDays: nextRangeDays,
+        checkedTotal: 0,
+        summary: { normal: 0, expired: 0, banned: 0, failed: 0 },
+        refreshedCount: 0,
+        items: [],
+        truncated,
+        skipped
+      }
+    }
+
+    const appendItem = (item: CheckAccountStatusItem) => {
+      let result = checkResult.value
+      if (!result) {
+        result = makeCheckResult({ rangeDays, total: checkTotal.value || 0 })
+        checkResult.value = result
+      }
+
+      result.items.push(item)
+      result.checkedTotal = result.items.length
+
+      if (Object.prototype.hasOwnProperty.call(result.summary, item.status)) {
+        result.summary[item.status] += 1
+      }
+      if (item.refreshed) {
+        result.refreshedCount += 1
+      }
+    }
+
+    const handleProgress = (payload: any) => {
+      const processed = Number(payload?.processed || 0)
+      const total = Number(payload?.total ?? checkTotal.value ?? 0)
+      const percent = Number(payload?.percent)
+
+      if (Number.isFinite(processed)) {
+        checkProcessed.value = processed
+      }
+      if (Number.isFinite(total)) {
+        checkTotal.value = total
+      }
+      if (Number.isFinite(percent)) {
+        checkProgress.value = Math.max(0, Math.min(100, Math.round(percent)))
+      } else if (Number.isFinite(processed) && Number.isFinite(total) && total > 0) {
+        checkProgress.value = Math.max(0, Math.min(100, Math.round((processed / total) * 100)))
+      }
+
+      const result = checkResult.value
+      if (result) {
+        result.checkedTotal = Math.max(result.checkedTotal, checkProcessed.value)
+      }
+    }
+
+    const parseEventBlock = (block: string): { event: string; data: any } | null => {
+      const trimmed = block.trim()
+      if (!trimmed || trimmed.startsWith(':')) return null
+
+      const lines = trimmed.split(/\r?\n/)
+      let event = 'message'
+      const dataLines: string[] = []
+      for (const line of lines) {
+        if (!line) continue
+        if (line.startsWith(':')) continue
+        if (line.startsWith('event:')) {
+          event = line.slice('event:'.length).trim() || event
+          continue
+        }
+        if (line.startsWith('data:')) {
+          dataLines.push(line.slice('data:'.length).trimStart())
+        }
+      }
+
+      const dataText = dataLines.join('\n')
+      let data: any = dataText
+      if (dataText) {
+        try {
+          data = JSON.parse(dataText)
+        } catch {
+          // keep raw text
+        }
+      }
+
+      return { event, data }
+    }
+
+    while (true) {
+      const { value, done } = await reader.read()
+      if (done) break
+
+      buffer += decoder.decode(value, { stream: true })
+      // Events are delimited by a blank line.
+      // Keep a buffer because chunk boundaries may split frames.
+      while (true) {
+        const index = buffer.indexOf('\n\n')
+        if (index === -1) break
+
+        const block = buffer.slice(0, index)
+        buffer = buffer.slice(index + 2)
+        const parsed = parseEventBlock(block)
+        if (!parsed) continue
+
+        if (parsed.event === 'meta') {
+          checkResult.value = makeCheckResult(parsed.data)
+          continue
+        }
+        if (parsed.event === 'progress') {
+          handleProgress(parsed.data)
+          continue
+        }
+        if (parsed.event === 'item') {
+          appendItem(parsed.data as CheckAccountStatusItem)
+          continue
+        }
+        if (parsed.event === 'done') {
+          doneReceived = true
+
+          let result = checkResult.value
+          if (!result) {
+            result = makeCheckResult(parsed.data)
+            checkResult.value = result
+          }
+
+          result.message = parsed.data?.message || 'ok'
+          result.rangeDays = parsed.data?.rangeDays || rangeDays
+          result.checkedTotal = Number(parsed.data?.checkedTotal ?? result.items.length)
+          result.summary = parsed.data?.summary || result.summary
+          result.refreshedCount = Number(parsed.data?.refreshedCount ?? result.refreshedCount)
+          result.truncated = Boolean(parsed.data?.truncated ?? result.truncated)
+          result.skipped = Number(parsed.data?.skipped ?? result.skipped)
+          checkProgress.value = 100
+          break
+        }
+        if (parsed.event === 'error') {
+          const message = parsed.data?.error || '检查失败，请稍后重试'
+          throw new Error(message)
+        }
+      }
+
+      if (doneReceived) break
+    }
+
+    if (doneReceived) {
+      try {
+        await reader.cancel()
+      } catch {
+        // ignore
+      }
+    }
+
+    if (!doneReceived && checking.value && !checkAbortController?.signal.aborted) {
+      throw new Error('检查中断，请稍后重试')
+    }
+
+    const result = checkResult.value
+    if (result) {
+      const refreshedCount = Number(result?.refreshedCount || 0)
+      showSuccessToast({
+        title: '检查完成',
+        description: `正常 ${result.summary.normal} / 过期 ${result.summary.expired} / 封号 ${result.summary.banned} / 失败 ${result.summary.failed}${refreshedCount ? `；已刷新 Token ${refreshedCount} 个` : ''}`
+      })
+    }
+
+    try {
+      await loadAccounts()
+    } catch {
+      // ignore list refresh errors; keep check result visible
+    }
+  } catch (err: any) {
+    if (err?.name === 'AbortError') {
+      checkError.value = ''
+      checkProgress.value = 0
+      return
+    }
+    const message = err?.response?.data?.error || '检查失败，请稍后重试'
+    checkError.value = err?.message || message
+    showErrorToast(err?.message || message)
+    checkProgress.value = 0
+  } finally {
+    checking.value = false
+    if (checkAbortController) {
+      checkAbortController = null
+    }
+  }
+}
+
 // 搜索处理
 const handleSearch = () => {
   paginationMeta.value.page = 1
@@ -209,27 +917,37 @@ watch(searchQuery, () => {
   }, 300)
 })
 
+watch(
+  () => formData.value.chatgptAccountId,
+  (nextValue) => {
+    applyCheckedAccountSelection(String(nextValue || ''))
+  }
+)
+
 const openEditDialog = (account: GptAccount) => {
   editingAccount.value = account
-  formData.value = {
-    email: account.email,
-    token: account.token,
-    refreshToken: account.refreshToken || '',
-    userCount: account.userCount,
-    isDemoted: Boolean(account.isDemoted),
-    isBanned: Boolean(account.isBanned),
-    chatgptAccountId: account.chatgptAccountId || '',
-    oaiDeviceId: account.oaiDeviceId || '',
-    expireAt: toDatetimeLocal(account.expireAt || '')
-  }
+	  formData.value = {
+	    email: account.email,
+	    token: account.token,
+	    refreshToken: account.refreshToken || '',
+	    userCount: account.userCount,
+	    isBanned: Boolean(account.isBanned),
+	    chatgptAccountId: account.chatgptAccountId || '',
+	    oaiDeviceId: account.oaiDeviceId || '',
+	    expireAt: toDatetimeLocal(account.expireAt || '')
+	  }
   showDialog.value = true
 }
 
-const closeDialog = () => {
-  showDialog.value = false
-  editingAccount.value = null
-  formData.value = { email: '', token: '', refreshToken: '', userCount: 0, isDemoted: false, isBanned: false, chatgptAccountId: '', oaiDeviceId: '', expireAt: '' }
-}
+	const closeDialog = () => {
+	  showDialog.value = false
+	  editingAccount.value = null
+	  formData.value = { email: '', token: '', refreshToken: '', userCount: 0, isBanned: false, chatgptAccountId: '', oaiDeviceId: '', expireAt: '' }
+	  checkedChatgptAccounts.value = []
+	  checkAccessTokenError.value = ''
+	  checkingAccessToken.value = false
+	  resetOpenaiOAuthFlow()
+	}
 
 const handleSubmit = async () => {
   try {
@@ -570,13 +1288,33 @@ const handleInviteSubmit = async () => {
   <div class="space-y-8">
     <!-- Header Actions -->
     <Teleport v-if="teleportReady" to="#header-actions">
-      <Button
-        @click="showDialog = true"
-        class="bg-black hover:bg-gray-800 text-white rounded-xl px-5 h-10 shadow-lg shadow-black/10 transition-all hover:scale-[1.02] active:scale-[0.98]"
-      >
-        <Plus class="w-4 h-4 mr-2" />
-        新建账号
-      </Button>
+      <div class="flex items-center gap-3 flex-wrap justify-end">
+        <Button
+          variant="outline"
+          class="bg-white border-gray-200 text-gray-700 hover:bg-gray-50 h-10 rounded-xl px-4"
+          :disabled="loading"
+          @click="handleRefresh"
+        >
+          <RefreshCw class="w-4 h-4 mr-2" :class="loading ? 'animate-spin' : ''" />
+          刷新列表
+        </Button>
+        <Button
+          variant="outline"
+          class="bg-white border-gray-200 text-gray-700 hover:bg-gray-50 h-10 rounded-xl px-4"
+          :disabled="loading"
+          @click="openCheckDialog"
+        >
+          <Search class="w-4 h-4 mr-2" />
+          检查
+        </Button>
+        <Button
+          @click="showDialog = true"
+          class="bg-black hover:bg-gray-800 text-white rounded-xl px-5 h-10 shadow-lg shadow-black/10 transition-all hover:scale-[1.02] active:scale-[0.98]"
+        >
+          <Plus class="w-4 h-4 mr-2" />
+          新建账号
+        </Button>
+      </div>
     </Teleport>
 
     <!-- 筛选控制栏 -->
@@ -639,16 +1377,16 @@ const handleInviteSubmit = async () => {
         <div class="hidden md:block overflow-x-auto">
           <table class="w-full">
             <thead>
-              <tr class="border-b border-gray-100 bg-gray-50/50">
-                <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">ID</th>
-                <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">邮箱</th>
-                <th class="px-6 py-5 text-center text-xs font-semibold text-gray-400 uppercase tracking-wider">已加入</th>
-                <th class="px-6 py-5 text-center text-xs font-semibold text-gray-400 uppercase tracking-wider">待加入</th>
-                <th class="px-6 py-5 text-center text-xs font-semibold text-gray-400 uppercase tracking-wider">降级</th>
-                <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">过期时间</th>
-                <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">创建时间</th>
-                <th class="px-6 py-5 text-right text-xs font-semibold text-gray-400 uppercase tracking-wider">操作</th>
-              </tr>
+	              <tr class="border-b border-gray-100 bg-gray-50/50">
+	                <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">ID</th>
+	                <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">邮箱</th>
+	                <th class="px-6 py-5 text-center text-xs font-semibold text-gray-400 uppercase tracking-wider">状态</th>
+	                <th class="px-6 py-5 text-center text-xs font-semibold text-gray-400 uppercase tracking-wider">已加入</th>
+	                <th class="px-6 py-5 text-center text-xs font-semibold text-gray-400 uppercase tracking-wider">待加入</th>
+	                <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">过期时间</th>
+	                <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">创建时间</th>
+	                <th class="px-6 py-5 text-right text-xs font-semibold text-gray-400 uppercase tracking-wider">操作</th>
+	              </tr>
             </thead>
             <tbody class="divide-y divide-gray-50">
               <tr
@@ -662,35 +1400,39 @@ const handleInviteSubmit = async () => {
 	                    <div class="w-8 h-8 rounded-full bg-gradient-to-br from-gray-100 to-gray-200 flex items-center justify-center text-xs font-bold text-gray-600">
 	                      {{ account.email.charAt(0).toUpperCase() }}
 	                    </div>
-	                    <span
-	                      class="text-sm font-medium"
-	                      :class="account.isBanned ? 'text-red-600' : 'text-gray-900'"
-	                    >
-	                      {{ account.email }}
-	                    </span>
+                      <div class="min-w-0">
+                        <div class="flex flex-wrap items-center gap-2">
+                          <span
+                            class="text-sm font-medium break-all"
+                            :class="account.isBanned ? 'text-red-600' : 'text-gray-900'"
+                          >
+                            {{ account.email }}
+                          </span>
+                        </div>
+                      </div>
 	                  </div>
+	                </td>
+	                <td class="px-6 py-5 text-center">
+	                  <span
+	                    class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold border"
+	                    :class="statusBadge(getAccountListStatus(account)).class"
+	                  >
+	                    {{ statusBadge(getAccountListStatus(account)).label }}
+	                  </span>
 	                </td>
                 <td class="px-6 py-5 text-center">
                   <span class="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-semibold bg-blue-50 text-blue-600 border border-blue-100">
                     {{ account.userCount }} 人
                   </span>
                 </td>
-                <td class="px-6 py-5 text-center">
-                   <span class="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-semibold bg-purple-50 text-purple-600 border border-purple-100">
-                    {{ account.inviteCount ?? 0 }} 人
-                  </span>
-                </td>
-                <td class="px-6 py-5 text-center">
-                  <span
-                    class="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-semibold border"
-                    :class="account.isDemoted ? 'bg-amber-50 text-amber-700 border-amber-100' : 'bg-gray-50 text-gray-500 border-gray-100'"
-                  >
-                    {{ account.isDemoted ? '已降级' : '未降级' }}
-                  </span>
-                </td>
-                <td class="px-6 py-5 text-sm text-gray-500 font-mono">{{ account.expireAt || '-' }}</td>
-                <td class="px-6 py-5 text-sm text-gray-500">{{ formatShanghaiDate(account.createdAt, dateFormatOptions) }}</td>
-                <td class="px-6 py-5 text-right">
+	                <td class="px-6 py-5 text-center">
+	                   <span class="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-semibold bg-purple-50 text-purple-600 border border-purple-100">
+	                    {{ account.inviteCount ?? 0 }} 人
+	                  </span>
+	                </td>
+	                <td class="px-6 py-5 text-sm text-gray-500 font-mono">{{ account.expireAt || '-' }}</td>
+	                <td class="px-6 py-5 text-sm text-gray-500">{{ formatShanghaiDate(account.createdAt, dateFormatOptions) }}</td>
+	                <td class="px-6 py-5 text-right">
                   <div class="flex items-center justify-end gap-1">
                     <!-- Toggle Open -->
                     <Button 
@@ -773,24 +1515,28 @@ const handleInviteSubmit = async () => {
                  </div>
                  <div>
                     <p class="text-sm font-bold break-all" :class="account.isBanned ? 'text-red-600' : 'text-gray-900'">{{ account.email }}</p>
-                    <p class="text-xs text-blue-500 font-medium mt-0.5">#{{ account.id }}</p>
+                    <div class="mt-1 flex flex-wrap items-center gap-2">
+                      <p class="text-xs text-blue-500 font-medium">#{{ account.id }}</p>
+                    </div>
                  </div>
               </div>
-              <div class="flex flex-wrap justify-end gap-2">
-                 <span class="inline-flex items-center px-2 py-1 rounded-full text-xs font-semibold bg-blue-50 text-blue-600 border border-blue-100">
+              <div class="flex flex-col items-end gap-2">
+                <span
+                  class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold border"
+                  :class="statusBadge(getAccountListStatus(account)).class"
+                >
+                  {{ statusBadge(getAccountListStatus(account)).label }}
+                </span>
+                <div class="flex flex-wrap justify-end gap-2">
+                  <span class="inline-flex items-center px-2 py-1 rounded-full text-xs font-semibold bg-blue-50 text-blue-600 border border-blue-100">
                     {{ account.userCount }} 人
-                 </span>
-                 <span class="inline-flex items-center px-2 py-1 rounded-full text-xs font-semibold bg-purple-50 text-purple-600 border border-purple-100">
+                  </span>
+                  <span class="inline-flex items-center px-2 py-1 rounded-full text-xs font-semibold bg-purple-50 text-purple-600 border border-purple-100">
                     {{ account.inviteCount ?? 0 }} 待
-                 </span>
-                 <span
-                   class="inline-flex items-center px-2 py-1 rounded-full text-xs font-semibold border"
-                   :class="account.isDemoted ? 'bg-amber-50 text-amber-700 border-amber-100' : 'bg-gray-50 text-gray-500 border-gray-100'"
-                 >
-                   {{ account.isDemoted ? '已降级' : '未降级' }}
-                 </span>
+                  </span>
+                </div>
               </div>
-            </div>
+	            </div>
 
             <div class="grid grid-cols-2 gap-4 text-xs text-gray-500 mb-4 bg-gray-50/50 p-3 rounded-xl">
           <div>
@@ -883,15 +1629,15 @@ const handleInviteSubmit = async () => {
 
     <!-- Edit Dialog -->
     <Dialog v-model:open="showDialog">
-      <DialogContent class="sm:max-w-[500px] p-0 overflow-hidden bg-white border-none shadow-2xl rounded-3xl">
-        <DialogHeader class="px-8 pt-8 pb-4">
+      <DialogContent class="sm:max-w-[500px] p-0 overflow-hidden bg-white border-none shadow-2xl rounded-3xl max-h-[90vh] flex flex-col">
+        <DialogHeader class="px-8 pt-8 pb-4 shrink-0">
           <DialogTitle class="text-2xl font-bold text-gray-900">
             {{ editingAccount ? '编辑账号' : '新建账号' }}
           </DialogTitle>
         </DialogHeader>
         
-        <form @submit.prevent="handleSubmit" class="px-8 pb-8 space-y-5">
-           <div class="space-y-4">
+        <form @submit.prevent="handleSubmit" class="flex-1 min-h-0 flex flex-col">
+           <div class="flex-1 min-h-0 px-8 pb-6 space-y-4 overflow-y-auto">
               <div class="space-y-2">
                 <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">邮箱</Label>
                 <Input
@@ -903,34 +1649,187 @@ const handleInviteSubmit = async () => {
                 />
               </div>
 
-   <div class="space-y-2">
+              <div class="space-y-2">
                 <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">Access Token</Label>
-                <Input
-                  v-model="formData.token"
-                  required
-                  placeholder="sk-proj-..."
-                  class="h-11 bg-gray-50 border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-100 focus:border-blue-500 transition-all font-mono text-sm"
-                />
+                <div class="flex items-center gap-2">
+                  <Input
+                    v-model="formData.token"
+                    required
+                    placeholder="eyJhbGciOi..."
+                    class="h-11 flex-1 bg-gray-50 border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-100 focus:border-blue-500 transition-all font-mono text-sm"
+                  />
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    class="h-11 rounded-xl border-gray-200"
+                    :disabled="checkingAccessToken || !formData.token?.trim()"
+                    @click="handleCheckAccessToken"
+                  >
+                    <template v-if="checkingAccessToken">
+                      <span class="animate-spin w-4 h-4 border-2 border-current border-t-transparent rounded-full mr-2"></span>
+                      校验中
+                    </template>
+                    <template v-else>
+                      校验
+                    </template>
+                  </Button>
+                </div>
+                <p v-if="checkAccessTokenError" class="text-[12px] text-red-600">{{ checkAccessTokenError }}</p>
+                <p v-else-if="checkedChatgptAccounts.length" class="text-[12px] text-gray-400">已获取 {{ checkedChatgptAccounts.length }} 个账号，可在 ChatGPT ID 下拉选择</p>
               </div>
 
               <div class="space-y-2">
                 <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">Refresh Token</Label>
-                <Input
-                  v-model="formData.refreshToken"
-                  placeholder="可选，用于自动刷新"
-                  class="h-11 bg-gray-50 border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-100 focus:border-blue-500 transition-all font-mono text-sm"
-                />
+                <div class="flex items-center gap-2">
+                  <Input
+                    v-model="formData.refreshToken"
+                    placeholder="可选，用于自动刷新"
+                    class="h-11 flex-1 bg-gray-50 border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-100 focus:border-blue-500 transition-all font-mono text-sm"
+                  />
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    class="h-11 rounded-xl border-gray-200"
+                    :disabled="generatingOpenaiAuthUrl"
+                    @click="handleClickGetRefreshToken"
+                  >
+                    <template v-if="generatingOpenaiAuthUrl">
+                      <span class="animate-spin w-4 h-4 border-2 border-current border-t-transparent rounded-full mr-2"></span>
+                      生成中
+                    </template>
+                    <template v-else>
+                      获取
+                    </template>
+                  </Button>
+                </div>
+
+                <div
+                  v-if="showOpenaiOAuthPanel"
+                  class="rounded-2xl border border-gray-100 bg-gray-50/70 p-4 space-y-4"
+                >
+                  <div class="flex items-start justify-between gap-3">
+                    <div class="space-y-1">
+                      <p class="text-sm font-semibold text-gray-800">通过 OpenAI OAuth 获取 Refresh Token</p>
+                      <p class="text-[12px] text-gray-500">会话有效期约 10 分钟；支持粘贴回调 URL 或直接粘贴 code。</p>
+                    </div>
+                    <Button
+                      type="button"
+                      size="icon"
+                      variant="ghost"
+                      class="h-8 w-8 text-gray-400 hover:text-gray-700"
+                      :disabled="generatingOpenaiAuthUrl || exchangingOpenaiCode"
+                      @click="resetOpenaiOAuthFlow"
+                      title="关闭"
+                    >
+                      <X class="w-4 h-4" />
+                    </Button>
+                  </div>
+
+                  <div v-if="openaiOAuthSession?.authUrl" class="space-y-2">
+                    <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">授权链接</Label>
+                    <div class="flex items-center gap-2">
+                      <Input
+                        :model-value="openaiOAuthSession?.authUrl || ''"
+                        readonly
+                        class="h-11 flex-1 bg-white border-gray-200 rounded-xl font-mono text-xs"
+                      />
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        class="h-11 rounded-xl border-gray-200"
+                        @click="copyText(openaiOAuthSession?.authUrl || '', '已复制授权链接')"
+                      >
+                        复制
+                      </Button>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        class="h-11 rounded-xl border-gray-200"
+                        @click="handleOpenAuthUrl"
+                      >
+                        打开
+                      </Button>
+                    </div>
+
+                    <div v-if="openaiOAuthSession?.instructions?.length" class="space-y-1 text-[12px] text-gray-500">
+                      <p v-for="(item, idx) in openaiOAuthSession.instructions" :key="idx">{{ item }}</p>
+                    </div>
+                  </div>
+
+                  <div class="space-y-2">
+                    <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">回调 URL / 授权码</Label>
+                    <Input
+                      v-model="openaiOAuthInput"
+                      placeholder="粘贴回调 URL（含 code=）或直接粘贴 code"
+                      class="h-11 bg-white border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-100 focus:border-blue-500 transition-all font-mono text-sm"
+                    />
+                  </div>
+
+                  <div class="flex items-center gap-2">
+                    <Button
+                      type="button"
+                      class="h-11 rounded-xl"
+                      :disabled="exchangingOpenaiCode || !openaiOAuthInput.trim() || !openaiOAuthSession?.sessionId"
+                      @click="handleExchangeOpenaiCode"
+                    >
+                      <template v-if="exchangingOpenaiCode">
+                        <span class="animate-spin w-4 h-4 border-2 border-current border-t-transparent rounded-full mr-2"></span>
+                        转换中
+                      </template>
+                      <template v-else>
+                        转换并填入
+                      </template>
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      class="h-11 rounded-xl border-gray-200"
+                      :disabled="generatingOpenaiAuthUrl || exchangingOpenaiCode"
+                      @click="generateOpenaiAuthUrl"
+                    >
+                      重新获取链接
+                    </Button>
+                  </div>
+
+                  <p v-if="openaiOAuthError" class="text-[12px] text-red-600">{{ openaiOAuthError }}</p>
+
+                  <div
+                    v-if="openaiOAuthResult"
+                    class="rounded-xl bg-white/80 border border-gray-100 p-3 text-[12px] text-gray-600 space-y-1"
+                  >
+                    <p>已解析账号：{{ openaiOAuthResult?.accountInfo?.email || '-' }}</p>
+                    <p>ChatGPT ID：{{ openaiOAuthResult?.accountInfo?.accountId || '-' }}</p>
+                  </div>
+                </div>
               </div>
 
 		              <div class="grid grid-cols-2 gap-4">
 		                 <div class="space-y-2">
 		                    <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">ChatGPT ID</Label>
-		                    <Input
-		                      v-model="formData.chatgptAccountId"
-		                      required
-		                      placeholder="必填"
-		                      class="h-11 bg-gray-50 border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-100 focus:border-blue-500 transition-all font-mono text-sm"
-		                    />
+                        <div class="flex items-center gap-2">
+                          <Input
+                            id="chatgpt-account-id-input"
+                            v-model="formData.chatgptAccountId"
+                            required
+                            placeholder="必填"
+                            :list="checkedChatgptAccounts.length ? 'chatgpt-account-id-options' : undefined"
+                            class="h-11 flex-1 bg-gray-50 border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-100 focus:border-blue-500 transition-all font-mono text-sm"
+                          />
+                        </div>
+                        <datalist v-if="checkedChatgptAccounts.length" id="chatgpt-account-id-options">
+                          <option
+                            v-for="acc in checkedChatgptAccounts"
+                            :key="acc.accountId"
+                            :value="acc.accountId"
+                          >
+                            {{ acc.name }}{{ acc.expiresAt ? ` (到期 ${acc.expiresAt})` : '' }}
+                          </option>
+                        </datalist>
 		                 </div>
 		                 <div class="space-y-2">
 		                    <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">设备 ID</Label>
@@ -942,33 +1841,12 @@ const handleInviteSubmit = async () => {
 		                 </div>
 		              </div>
 
-                  <div class="grid grid-cols-2 gap-4">
-                    <div class="space-y-2">
-                      <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">降级状态</Label>
-                      <div class="flex items-center gap-1 bg-gray-100 p-1 rounded-xl">
-                        <button
-                          type="button"
-                          class="flex-1 px-3 py-1.5 rounded-lg text-sm font-medium transition-all"
-                          :class="!formData.isDemoted ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'"
-                          @click="formData.isDemoted = false"
-                        >
-                          未降级
-                        </button>
-                        <button
-                          type="button"
-                          class="flex-1 px-3 py-1.5 rounded-lg text-sm font-medium transition-all"
-                          :class="formData.isDemoted ? 'bg-amber-50 text-amber-700 shadow-sm' : 'text-gray-500 hover:text-gray-700'"
-                          @click="formData.isDemoted = true"
-                        >
-                          已降级
-                        </button>
-                      </div>
-                    </div>
-                    <div class="space-y-2">
-                      <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">封禁状态</Label>
-                      <div class="flex items-center gap-1 bg-gray-100 p-1 rounded-xl">
-                        <button
-                          type="button"
+	                  <div class="grid grid-cols-1 gap-4">
+	                    <div class="space-y-2">
+	                      <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">封禁状态</Label>
+	                      <div class="flex items-center gap-1 bg-gray-100 p-1 rounded-xl">
+	                        <button
+	                          type="button"
                           class="flex-1 px-3 py-1.5 rounded-lg text-sm font-medium transition-all"
                           :class="!formData.isBanned ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'"
                           @click="formData.isBanned = false"
@@ -997,7 +1875,7 @@ const handleInviteSubmit = async () => {
 		              </div>
 		           </div>
 
-           <DialogFooter class="pt-4">
+           <DialogFooter class="px-8 pb-8 pt-4 shrink-0 border-t border-gray-100 bg-white/80 backdrop-blur">
               <Button type="button" variant="ghost" @click="closeDialog" class="rounded-xl h-11 px-6 text-gray-500 hover:text-gray-900 hover:bg-gray-100">
                 取消
               </Button>
@@ -1006,6 +1884,214 @@ const handleInviteSubmit = async () => {
               </Button>
          </DialogFooter>
         </form>
+      </DialogContent>
+    </Dialog>
+
+    <!-- Check Status Dialog -->
+    <Dialog v-model:open="showCheckDialog">
+      <DialogContent class="sm:max-w-[900px] p-0 overflow-hidden bg-white border-none shadow-2xl rounded-3xl max-h-[90vh] flex flex-col">
+        <DialogHeader class="px-8 pt-8 pb-4 shrink-0">
+          <DialogTitle class="text-2xl font-bold text-gray-900">检查账号状态</DialogTitle>
+          <p class="text-sm text-gray-500 mt-2">
+            选择时间范围后，将同步该范围内创建账号的状态（封号 / 过期 / 正常）。已封号账号会自动跳过；新发现封号会写入系统；过期仅展示不做自动关闭。
+          </p>
+        </DialogHeader>
+
+        <div class="flex-1 min-h-0 px-8 pb-6 space-y-5 overflow-y-auto">
+          <div class="flex flex-col sm:flex-row sm:items-end gap-4">
+            <div class="space-y-2">
+              <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">时间范围</Label>
+              <Select v-model="checkRangeDays" :disabled="checking">
+                <SelectTrigger class="h-11 w-full sm:w-[160px] bg-gray-50 border-gray-200 rounded-xl">
+                  <SelectValue placeholder="选择范围" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="7">近 7 天</SelectItem>
+                  <SelectItem value="15">近 15 天</SelectItem>
+                  <SelectItem value="30">近 30 天</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+
+            <Button
+              class="h-11 rounded-xl bg-black text-white hover:bg-gray-800 sm:ml-auto"
+              :disabled="checking"
+              @click="handleStartCheck"
+            >
+              <template v-if="checking">
+                <span class="animate-spin w-4 h-4 border-2 border-current border-t-transparent rounded-full mr-2"></span>
+                检查中...
+              </template>
+              <template v-else>
+                开始检查
+              </template>
+            </Button>
+          </div>
+
+          <div v-if="checking" class="space-y-2">
+            <div class="flex items-center justify-between text-xs text-gray-500">
+              <span>
+                正在检查账号状态...
+                <span v-if="checkTotal !== null" class="ml-2 font-mono text-gray-400">({{ checkProcessed }}/{{ checkTotal }})</span>
+              </span>
+              <span class="font-mono">{{ checkProgress }}%</span>
+            </div>
+            <div class="h-2 w-full rounded-full bg-gray-100 overflow-hidden">
+              <div
+                class="h-2 rounded-full bg-black transition-[width] duration-200"
+                :style="{ width: `${checkProgress}%` }"
+              ></div>
+            </div>
+          </div>
+
+          <div v-if="checkError" class="rounded-2xl border border-red-100 bg-red-50/50 p-4 flex items-start gap-3 text-red-600">
+            <AlertTriangle class="h-5 w-5 mt-0.5" />
+            <div class="min-w-0">
+              <p class="font-medium">检查失败</p>
+              <p class="text-sm text-red-600/90 mt-1 break-words">{{ checkError }}</p>
+            </div>
+          </div>
+
+          <div v-if="checkResult" class="space-y-4">
+            <div v-if="checkResult.truncated" class="rounded-2xl border border-orange-100 bg-orange-50/50 p-4 text-orange-700 text-sm leading-relaxed">
+              仅检查最近 {{ checkTotal ?? checkResult.checkedTotal }} 个账号，跳过 {{ checkResult.skipped }} 个（为避免请求耗时过长）。
+            </div>
+
+            <p class="text-sm text-gray-500">共检查 {{ checkResult.checkedTotal }} 个账号（近 {{ checkResult.rangeDays }} 天）</p>
+            <div v-if="checkResult.refreshedCount" class="rounded-2xl border border-blue-100 bg-blue-50/50 p-4 text-blue-700 text-sm leading-relaxed">
+              已自动刷新 Token：{{ checkResult.refreshedCount }} 个
+            </div>
+
+            <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              <div class="rounded-2xl border border-gray-100 bg-gray-50/60 p-4">
+                <p class="text-[11px] font-semibold text-gray-500 uppercase tracking-wider">正常</p>
+                <p class="text-2xl font-bold text-gray-900 mt-1">{{ checkResult.summary.normal }}</p>
+              </div>
+              <div class="rounded-2xl border border-orange-100 bg-orange-50/60 p-4">
+                <p class="text-[11px] font-semibold text-orange-700/70 uppercase tracking-wider">过期</p>
+                <p class="text-2xl font-bold text-orange-700 mt-1">{{ checkResult.summary.expired }}</p>
+              </div>
+              <div class="rounded-2xl border border-red-100 bg-red-50/60 p-4">
+                <p class="text-[11px] font-semibold text-red-700/70 uppercase tracking-wider">封号</p>
+                <p class="text-2xl font-bold text-red-700 mt-1">{{ checkResult.summary.banned }}</p>
+              </div>
+              <div class="rounded-2xl border border-gray-200 bg-gray-50/60 p-4">
+                <p class="text-[11px] font-semibold text-gray-500 uppercase tracking-wider">失败</p>
+                <p class="text-2xl font-bold text-gray-900 mt-1">{{ checkResult.summary.failed }}</p>
+              </div>
+            </div>
+
+            <div class="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                class="px-3 py-1.5 rounded-full text-xs font-semibold border transition-colors"
+                :class="resultFilter === 'all' ? 'bg-black text-white border-black' : 'bg-white text-gray-600 border-gray-200 hover:bg-gray-50'"
+                @click="resultFilter = 'all'"
+              >
+                全部
+              </button>
+              <button
+                type="button"
+                class="px-3 py-1.5 rounded-full text-xs font-semibold border transition-colors"
+                :class="resultFilter === 'abnormal' ? 'bg-black text-white border-black' : 'bg-white text-gray-600 border-gray-200 hover:bg-gray-50'"
+                @click="resultFilter = 'abnormal'"
+              >
+                异常
+              </button>
+              <button
+                type="button"
+                class="px-3 py-1.5 rounded-full text-xs font-semibold border transition-colors"
+                :class="resultFilter === 'banned' ? 'bg-black text-white border-black' : 'bg-white text-gray-600 border-gray-200 hover:bg-gray-50'"
+                @click="resultFilter = 'banned'"
+              >
+                封号
+              </button>
+              <button
+                type="button"
+                class="px-3 py-1.5 rounded-full text-xs font-semibold border transition-colors"
+                :class="resultFilter === 'expired' ? 'bg-black text-white border-black' : 'bg-white text-gray-600 border-gray-200 hover:bg-gray-50'"
+                @click="resultFilter = 'expired'"
+              >
+                过期
+              </button>
+              <button
+                type="button"
+                class="px-3 py-1.5 rounded-full text-xs font-semibold border transition-colors"
+                :class="resultFilter === 'normal' ? 'bg-black text-white border-black' : 'bg-white text-gray-600 border-gray-200 hover:bg-gray-50'"
+                @click="resultFilter = 'normal'"
+              >
+                正常
+              </button>
+              <button
+                type="button"
+                class="px-3 py-1.5 rounded-full text-xs font-semibold border transition-colors"
+                :class="resultFilter === 'failed' ? 'bg-black text-white border-black' : 'bg-white text-gray-600 border-gray-200 hover:bg-gray-50'"
+                @click="resultFilter = 'failed'"
+              >
+                失败
+              </button>
+            </div>
+
+            <div class="border border-gray-100 rounded-2xl overflow-hidden">
+              <div class="overflow-x-auto">
+                <table class="w-full text-sm">
+                  <thead class="bg-gray-50 text-gray-500 text-xs uppercase">
+                    <tr>
+                      <th class="px-4 py-3 text-left font-medium">状态</th>
+                      <th class="px-4 py-3 text-left font-medium">账号</th>
+                      <th class="px-4 py-3 text-left font-medium">创建时间</th>
+                      <th class="px-4 py-3 text-left font-medium">过期时间</th>
+                      <th class="px-4 py-3 text-left font-medium">原因</th>
+                    </tr>
+                  </thead>
+                  <tbody class="divide-y divide-gray-50">
+                    <tr v-for="item in filteredCheckItems" :key="item.id" class="hover:bg-gray-50/50">
+                      <td class="px-4 py-3">
+                        <div class="flex flex-wrap items-center gap-2">
+                          <span
+                            class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold border"
+                            :class="statusBadge(item.status).class"
+                          >
+                            {{ statusBadge(item.status).label }}
+                          </span>
+                          <span
+                            v-if="item.refreshed"
+                            class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold border bg-blue-50 text-blue-700 border-blue-200"
+                          >
+                            已刷新
+                          </span>
+                        </div>
+                      </td>
+                      <td class="px-4 py-3">
+                        <div class="font-medium text-gray-900 break-all">{{ item.email }}</div>
+                        <div class="text-xs text-gray-400">#{{ item.id }}</div>
+                      </td>
+                      <td class="px-4 py-3 text-gray-500 font-mono">{{ formatShanghaiDate(item.createdAt, dateFormatOptions) }}</td>
+                      <td class="px-4 py-3 text-gray-500 font-mono">{{ item.expireAt || '-' }}</td>
+                      <td class="px-4 py-3 text-gray-500">
+                        <span v-if="!item.reason">-</span>
+                        <span v-else class="break-words">{{ item.reason }}</span>
+                      </td>
+                    </tr>
+                    <tr v-if="!filteredCheckItems.length">
+                      <td colspan="5" class="px-4 py-8 text-center text-gray-400">暂无数据</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
+          <div v-else class="rounded-2xl border border-gray-100 bg-gray-50/40 p-4 text-sm text-gray-500 leading-relaxed">
+            提示：本功能只检查“近 N 天创建”的账号（已封号账号会跳过）；检查过程中可能会触发封号账号自动写入系统（is_banned=1）。
+          </div>
+        </div>
+
+        <DialogFooter class="px-8 pb-8 pt-4 shrink-0 border-t border-gray-100 bg-white/80 backdrop-blur">
+          <Button type="button" variant="outline" class="rounded-xl h-11 px-6 border-gray-200" @click="closeCheckDialog">
+            关闭
+          </Button>
+        </DialogFooter>
       </DialogContent>
     </Dialog>
 

@@ -1,6 +1,7 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import { configService, type AppRuntimeConfig } from '@/services/api'
+import type { Channel } from '@/services/api'
 
 const DEFAULT_TIMEZONE = 'Asia/Shanghai'
 const DEFAULT_LOCALE = 'zh-CN'
@@ -21,6 +22,7 @@ export const useAppConfigStore = defineStore('app-config', () => {
   const loaded = ref(false)
   const turnstileSiteKey = ref('')
   const turnstileEnabled = ref<boolean | null>(null)
+  const channels = ref<Channel[]>([])
   const openAccountsEnabled = ref(true)
   const openAccountsMaintenanceMessage = ref(DEFAULT_OPEN_ACCOUNTS_MAINTENANCE_MESSAGE)
   const features = ref<FeatureFlags>({
@@ -74,6 +76,9 @@ export const useAppConfigStore = defineStore('app-config', () => {
       if ('registration' in config.features) next.registration = Boolean((config.features as any).registration)
       features.value = next
     }
+    if (Array.isArray(config.channels)) {
+      channels.value = config.channels as Channel[]
+    }
   }
 
   const loadConfig = async () => {
@@ -94,6 +99,7 @@ export const useAppConfigStore = defineStore('app-config', () => {
     loaded,
     turnstileSiteKey,
     turnstileEnabled,
+    channels,
     openAccountsEnabled,
     openAccountsMaintenanceMessage,
     features,
