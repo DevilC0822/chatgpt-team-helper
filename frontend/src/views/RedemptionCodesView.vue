@@ -72,6 +72,8 @@ const orderTypeOptions: { value: PurchaseOrderType; label: string }[] = [
 ]
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 const EXPIRE_AT_PARSE_REGEX = /^(\d{4})[/-](\d{1,2})[/-](\d{1,2})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?$/
+const SHANGHAI_TIMEZONE = 'Asia/Shanghai'
+const TODAY_MARK_REMAINING_DAYS = 30
 const DAY_MS = 24 * 60 * 60 * 1000
 const updatingChannelId = ref<number | null>(null)
 let popoverTimer: ReturnType<typeof setTimeout> | null = null
@@ -139,7 +141,7 @@ const getRedeemerEmail = (code: RedemptionCode) => extractRedeemerEmail(code.red
 const getRedeemerDisplay = (code: RedemptionCode) => code.redeemedBy || code.reservedForUid || ''
 const hasPendingReservation = (code: RedemptionCode) => Boolean(code.reservedForUid && !code.isRedeemed)
 
-const parseExpireAtToMs = (value?: string | null) => {
+const parseExpireAtToDateParts = (value?: string | null) => {
   const raw = String(value ?? '').trim()
   if (!raw) return null
   const match = raw.match(EXPIRE_AT_PARSE_REGEX)
@@ -148,15 +150,43 @@ const parseExpireAtToMs = (value?: string | null) => {
   const year = Number(match[1])
   const month = Number(match[2])
   const day = Number(match[3])
-  const hour = Number(match[4])
-  const minute = Number(match[5])
-  const second = match[6] != null ? Number(match[6]) : 0
-  if (![year, month, day, hour, minute, second].every(Number.isFinite)) return null
+  if (![year, month, day].every(Number.isFinite)) return null
+  if (month < 1 || month > 12) return null
+  if (day < 1 || day > 31) return null
+  return { year, month, day }
+}
 
-  const pad = (value: number) => String(value).padStart(2, '0')
-  const iso = `${year}-${pad(month)}-${pad(day)}T${pad(hour)}:${pad(minute)}:${pad(second)}+08:00`
-  const parsed = Date.parse(iso)
-  return Number.isNaN(parsed) ? null : parsed
+const getShanghaiTodayDateParts = () => {
+  try {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: SHANGHAI_TIMEZONE,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit'
+    }).formatToParts(new Date())
+    const getPart = (type: string) => parts.find(part => part.type === type)?.value || ''
+    const year = Number(getPart('year'))
+    const month = Number(getPart('month'))
+    const day = Number(getPart('day'))
+    if (![year, month, day].every(Number.isFinite)) return null
+    return { year, month, day }
+  } catch {
+    const now = new Date()
+    return {
+      year: now.getFullYear(),
+      month: now.getMonth() + 1,
+      day: now.getDate()
+    }
+  }
+}
+
+const getDateDiffDays = (
+  target: { year: number; month: number; day: number },
+  base: { year: number; month: number; day: number }
+) => {
+  const targetMs = Date.UTC(target.year, target.month - 1, target.day)
+  const baseMs = Date.UTC(base.year, base.month - 1, base.day)
+  return Math.floor((targetMs - baseMs) / DAY_MS)
 }
 
 const getBoundAccount = (code: RedemptionCode) => {
@@ -167,18 +197,15 @@ const getBoundAccount = (code: RedemptionCode) => {
 
 const getBoundAccountRemainingDays = (code: RedemptionCode) => {
   const account = getBoundAccount(code)
-  const expireAtMs = parseExpireAtToMs(account?.expireAt)
-  if (expireAtMs == null) return null
-  const diffMs = expireAtMs - Date.now()
-  if (diffMs >= 0) {
-    return Math.floor(diffMs / DAY_MS)
-  }
-  return -Math.ceil(Math.abs(diffMs) / DAY_MS)
+  const expireAt = parseExpireAtToDateParts(account?.expireAt)
+  const today = getShanghaiTodayDateParts()
+  if (!expireAt || !today) return null
+  return getDateDiffDays(expireAt, today)
 }
 
 const isCodeUsableToday = (code: RedemptionCode) => {
   const remainingDays = getBoundAccountRemainingDays(code)
-  return typeof remainingDays === 'number' && remainingDays >= 0
+  return typeof remainingDays === 'number' && remainingDays === TODAY_MARK_REMAINING_DAYS
 }
 
 const getCodeTodayLabel = (code: RedemptionCode) => {
