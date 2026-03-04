@@ -57,7 +57,7 @@ const ORDER_TYPE_ANTI_BAN = 'anti_ban'
 const ORDER_TYPE_SET = new Set([ORDER_TYPE_WARRANTY, ORDER_TYPE_NO_WARRANTY, ORDER_TYPE_ANTI_BAN])
 const normalizeOrderType = (value) => {
   const normalized = String(value || '').trim().toLowerCase()
-  return ORDER_TYPE_SET.has(normalized) ? normalized : ORDER_TYPE_WARRANTY
+  return ORDER_TYPE_SET.has(normalized) ? normalized : ORDER_TYPE_NO_WARRANTY
 }
 const isNoWarrantyOrderType = (value) => normalizeOrderType(value) === ORDER_TYPE_NO_WARRANTY
 const isAntiBanOrderType = (value) => normalizeOrderType(value) === ORDER_TYPE_ANTI_BAN

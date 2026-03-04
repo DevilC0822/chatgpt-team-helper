@@ -46,7 +46,7 @@ const selectedCodes = ref<number[]>([])
 const showRedeemDialog = ref(false)
 const redeemTargetCode = ref<RedemptionCode | null>(null)
 const redeemEmail = ref('')
-const redeemOrderType = ref<PurchaseOrderType>('warranty')
+const redeemOrderType = ref<PurchaseOrderType>('no_warranty')
 const redeeming = ref(false)
 const reinvitingCodeIds = ref<number[]>([])
 const appConfigStore = useAppConfigStore()
@@ -71,6 +71,8 @@ const orderTypeOptions: { value: PurchaseOrderType; label: string }[] = [
   { value: 'no_warranty', label: '无质保订单' },
 ]
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+const EXPIRE_AT_PARSE_REGEX = /^(\d{4})[/-](\d{1,2})[/-](\d{1,2})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?$/
+const DAY_MS = 24 * 60 * 60 * 1000
 const updatingChannelId = ref<number | null>(null)
 let popoverTimer: ReturnType<typeof setTimeout> | null = null
 const { success: showSuccessToast, info: showInfoToast, warning: showWarningToast, error: showErrorToast } = useToast()
@@ -136,6 +138,61 @@ const extractRedeemerEmail = (redeemedBy?: string | null) => {
 const getRedeemerEmail = (code: RedemptionCode) => extractRedeemerEmail(code.redeemedBy)
 const getRedeemerDisplay = (code: RedemptionCode) => code.redeemedBy || code.reservedForUid || ''
 const hasPendingReservation = (code: RedemptionCode) => Boolean(code.reservedForUid && !code.isRedeemed)
+
+const parseExpireAtToMs = (value?: string | null) => {
+  const raw = String(value ?? '').trim()
+  if (!raw) return null
+  const match = raw.match(EXPIRE_AT_PARSE_REGEX)
+  if (!match) return null
+
+  const year = Number(match[1])
+  const month = Number(match[2])
+  const day = Number(match[3])
+  const hour = Number(match[4])
+  const minute = Number(match[5])
+  const second = match[6] != null ? Number(match[6]) : 0
+  if (![year, month, day, hour, minute, second].every(Number.isFinite)) return null
+
+  const pad = (value: number) => String(value).padStart(2, '0')
+  const iso = `${year}-${pad(month)}-${pad(day)}T${pad(hour)}:${pad(minute)}:${pad(second)}+08:00`
+  const parsed = Date.parse(iso)
+  return Number.isNaN(parsed) ? null : parsed
+}
+
+const getBoundAccount = (code: RedemptionCode) => {
+  const normalizedEmail = String(code.accountEmail || '').trim().toLowerCase()
+  if (!normalizedEmail) return null
+  return accountsByEmail.value.get(normalizedEmail) || null
+}
+
+const getBoundAccountRemainingDays = (code: RedemptionCode) => {
+  const account = getBoundAccount(code)
+  const expireAtMs = parseExpireAtToMs(account?.expireAt)
+  if (expireAtMs == null) return null
+  const diffMs = expireAtMs - Date.now()
+  if (diffMs >= 0) {
+    return Math.floor(diffMs / DAY_MS)
+  }
+  return -Math.ceil(Math.abs(diffMs) / DAY_MS)
+}
+
+const isCodeUsableToday = (code: RedemptionCode) => {
+  const remainingDays = getBoundAccountRemainingDays(code)
+  return typeof remainingDays === 'number' && remainingDays >= 0
+}
+
+const getCodeTodayLabel = (code: RedemptionCode) => {
+  if (!code.accountEmail) return '否'
+  return isCodeUsableToday(code) ? '是' : '否'
+}
+
+const getCodeRemainingDaysLabel = (code: RedemptionCode) => {
+  if (!code.accountEmail) return '未绑定账号'
+  const remainingDays = getBoundAccountRemainingDays(code)
+  if (remainingDays == null) return '剩余天数未知'
+  if (remainingDays >= 0) return `剩余 ${remainingDays} 天`
+  return `已过期 ${Math.abs(remainingDays)} 天`
+}
 
 const hideTextPopover = () => {
   showTextPopover.value = false
@@ -618,7 +675,7 @@ const openRedeemDialog = (code: RedemptionCode) => {
 
   redeemTargetCode.value = code
   redeemEmail.value = code.redeemedBy || ''
-  redeemOrderType.value = code.orderType === 'no_warranty' ? 'no_warranty' : 'warranty'
+  redeemOrderType.value = code.orderType === 'warranty' ? 'warranty' : 'no_warranty'
   showRedeemDialog.value = true
 }
 
@@ -626,7 +683,7 @@ const closeRedeemDialog = () => {
   showRedeemDialog.value = false
   redeemTargetCode.value = null
   redeemEmail.value = ''
-  redeemOrderType.value = 'warranty'
+  redeemOrderType.value = 'no_warranty'
   redeeming.value = false
 }
 
@@ -990,6 +1047,7 @@ const handleInviteSubmit = async () => {
                 <th class="px-6 py-5 text-center text-xs font-semibold text-gray-400 uppercase tracking-wider">状态</th>
                 <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">渠道</th>
                 <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">所属账号</th>
+                <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">是否今日</th>
                 <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">兑换用户</th>
                 <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">创建时间</th>
                 <th class="px-6 py-5 text-right text-xs font-semibold text-gray-400 uppercase tracking-wider">操作</th>
@@ -1068,9 +1126,22 @@ const handleInviteSubmit = async () => {
                         <RefreshCw class="w-3.5 h-3.5" :class="{ 'animate-spin': syncingAccountEmail === code.accountEmail }" />
 	                      </button>
 	                    </template>
-	                    <span v-else class="text-sm text-gray-400">-</span>
-	                  </div>
-	                </td>
+		                    <span v-else class="text-sm text-gray-400">-</span>
+		                  </div>
+		                </td>
+                <td class="px-6 py-5">
+                  <div class="flex flex-col items-start gap-1">
+                    <span
+                      class="inline-flex items-center rounded-full px-2.5 py-1 text-xs font-semibold border"
+                      :class="isCodeUsableToday(code) ? 'bg-green-50 text-green-700 border-green-200' : 'bg-red-50 text-red-700 border-red-200'"
+                    >
+                      {{ getCodeTodayLabel(code) }}
+                    </span>
+                    <span class="text-xs text-gray-500">
+                      {{ getCodeRemainingDaysLabel(code) }}
+                    </span>
+                  </div>
+                </td>
                 <td class="px-6 py-5">
                    <div class="flex flex-col items-start gap-1">
                       <span
@@ -1206,9 +1277,22 @@ const handleInviteSubmit = async () => {
                         </div>
                         <span class="text-xs text-gray-700 truncate">-</span>
                       </div>
-                   </div>
-                </div>
+	                   </div>
+	                </div>
 
+                <div class="rounded-xl bg-gray-50 p-3">
+                  <div class="flex items-center justify-between">
+                    <span class="text-xs text-gray-400">是否今日</span>
+                    <span
+                      class="inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-semibold border"
+                      :class="isCodeUsableToday(code) ? 'bg-green-50 text-green-700 border-green-200' : 'bg-red-50 text-red-700 border-red-200'"
+                    >
+                      {{ getCodeTodayLabel(code) }}
+                    </span>
+                  </div>
+                  <p class="mt-1 text-xs text-gray-600">{{ getCodeRemainingDaysLabel(code) }}</p>
+                </div>
+                
                 <div v-if="getRedeemerDisplay(code) || hasPendingReservation(code)" class="bg-gray-50 p-3 rounded-xl">
                    <div class="flex items-center justify-between">
                       <span class="text-xs text-gray-400">兑换用户</span>
